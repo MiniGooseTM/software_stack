@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "self-balancing-robot"
+version = "0.1.0"
+description = "MuJoCo environment and PPO training setup for a self-balancing robot"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "gymnasium>=0.29,<1.1",
+    "imageio>=2.31,<3",
+    "mujoco>=3.2,<3.3",
+    "numpy>=1.24,<3",
+    "stable-baselines3>=2.3,<3",
+    "tensorboard>=2.14,<3",
+    "torch>=2.2,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.6,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+self_balancing_robot = ["assets/*.xml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
