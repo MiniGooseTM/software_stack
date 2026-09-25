@@ -1,0 +1,140 @@
+<mujoco model="MiniGoose TM test">
+
+    <compiler   angle="radian" 
+                eulerseq="XYZ" 
+                inertiafromgeom="false" />
+    <option timestep="0.005"
+          gravity="0 0 -9.81"
+          integrator="implicitfast"/>
+    <default>
+        <default class="visual">
+            <!-- No collision, no mass, shown in viewer group 2-->
+            <geom type="mesh" contype="0" conaffinity="0" group="2" density="0"/>
+        </default>
+        <default class="collision">
+            <!-- group 3 is hidden by default -->
+            <geom contype="1" conaffinity="1" group="3"/>
+        </default>
+        <geom contype="1" conaffinity="1" friction = "0.8 0.005 0.0001"/>
+    </default>
+
+    <!-- Scale all meshes to meters -->
+    <asset>
+        <mesh name="left_wheel_1" file="meshes/left_wheel_1.stl" scale="0.001 0.001 0.001" />
+        <mesh name="right_wheel_1" file="meshes/right_wheel_1.stl" scale="0.001 0.001 0.001" />
+        <mesh name="base_link" file="meshes/base_link.stl" scale="0.001 0.001 0.001" />
+
+                <!-- Use simple gradient for sky texture -->
+        <texture type="skybox"
+                builtin="gradient"
+                rgb1="0.5 0.7 1"
+                rgb2="0.95 0.95 1"
+                width="256"
+                height="256"/>
+
+        <!-- Use built-in checker pattern to create grid texture -->
+        <texture name="grid"
+                type="2d"
+                builtin="checker"
+                rgb1="0.2 0.3 0.4"
+                rgb2="0.3 0.4 0.5"
+                width="512"
+                height="512"
+                mark="cross"
+                markrgb="0.8 0.8 0.8"/>
+
+        <!-- Create a grid material from the grid texture  -->
+        <material name="grid"
+                texture="grid"
+                texrepeat="5 5"
+                reflectance="0"
+                specular="0"
+                shininess="0"/>
+
+
+        <material name="duck_gray_color" rgba="0.7 0.7 0.7 1"/>
+        <material name="duck_orange_color" rgba="1 0.5 0 1"/>
+    </asset>
+
+    <worldbody>
+         <light pos="0 0 1.5" 
+           dir="0 0 -1" 
+           diffuse="0.8 0.8 0.8"/>
+
+        <geom name="ground"
+          type="plane"
+          size="5 5 0.1"
+          material="grid"/>
+
+        <!-- Shift the robot upwards (wheel radius) -->
+        <body name="base_link" pos="0.0 0.0 0.03" euler="0.0 -0.0 0.0">
+            <!-- So that the robot can move freely -->
+            <joint name="base_link_joint" type="free"/> 
+
+            <geom name="base_link_geom" class="visual" material="duck_gray_color" mesh="base_link" pos="0 0 0" euler="0 0 0"/>
+            <!-- Add a visual box for the beak -->
+            <geom name="beak" class="visual" material="duck_orange_color" type="box" pos="-0.033 0.036 0.1" size="0.015 0.01 0.006"/>
+            <!-- Collision boxes fitted to the base_link mesh bounds (body frame) -->
+            <geom name="base_link_collision" class="collision" type="box" pos="-0.033 0 0.039" size="0.07 0.05 0.046"/>
+            <inertial   mass="0.46782549584016825" 
+                        pos="-0.03206573521335721 0.0017328147275224928 0.048921665480989134" 
+                        fullinertia="0.0008962476516224905 0.0011391458915049747 0.000888671673522702 -2.5960177379058845e-06 -3.521393831307012e-06 -5.3121337361301284e-05" />
+            <site name="imu_site"
+                type="box"
+                pos="-0.063 -0.02 0.019"
+                size="0.005 0.005 0.002"
+                rgba="1 0 0 1"/>
+                <!-- center of the box: pos ="-0.033 0 0.039"-->
+            <body   name="left_wheel" 
+                    pos="-0.011699999999999981 -2.0915308113025002e-19 4.163336342344334e-18" 
+                    euler="-6.178002911003319e-47 3.7097668810517888e-31 -5.8731934547530045e-92">
+
+                <!-- armature: rotor inertia * 150^2 (estimate); frictionloss: gearbox static friction (estimate) -->
+                <joint  name="left_wheel_joint" 
+                        type="hinge" 
+                        armature="5.6e-5" 
+                        frictionloss="0.01" 
+                        axis="-1.0 -0.0 0" 
+                        pos="-0.07330000000000003 2.0915308113024993e-19 -4.163336342344359e-18" />
+                <!-- Wheels collide as simple cylinders (r=3cm, w=2cm) -->
+                <geom name="left_wheel" class="visual" mesh="left_wheel_1" material="duck_orange_color" pos="0 0 0" euler="0 0 0"/>
+                <geom name="left_wheel_collision" class="collision" type="cylinder" fromto="-0.0958 0 0 -0.0758 0 0" size="0.03"/>
+                <inertial mass="0.028211391752816978" pos="-0.08579999999999999 3.302548840908946e-07 -5.692121100893504e-16" fullinertia="1.2723384092540796e-05 7.3020671144276075e-06 7.302076428300902e-06 9.578441300634349e-21 6.4517280407014105e-21 8.5212095084014e-21" />
+            </body>
+
+            <body name="right_wheel" pos="-0.054299999999999536 -9.761000899653904e-18 6.211448840029619e-18" euler="0.22100366976259359 3.921488860202698e-22 3.141592653589793">
+                <joint name="right_wheel_joint" type="hinge" armature="5.6e-5" frictionloss="0.01" axis="1 0 0" pos="-0.07329999999999905 -3.008392216567465e-16 1.996116904031912e-17" />
+                <geom name="right_wheel" class="visual" mesh="right_wheel_1" material="duck_orange_color" pos="0 0 0" euler="0 0 0" />
+                <geom name="right_wheel_collision" class="collision" type="cylinder" fromto="-0.0958 0 0 -0.0758 0 0" size="0.03"/>
+                <inertial mass="0.028211391752816978" pos="-0.08579999999999888 3.3025488375149304e-07 -5.41257772299532e-16" fullinertia="1.2723384092540462e-05 7.302067114429333e-06 7.302076428303286e-06 9.103245457528128e-19 -6.773763175830148e-20 -9.063252535621014e-20" />
+            </body>
+        </body>
+    </worldbody>
+
+    <!-- Add actuators -->
+    <!-- Note: the actuators right now are modelled as velocity controlled, which is probably in line of how the real
+     motors will be used. But another idea would be to just use torque control (though we cant measure it), or 
+     implement a PID within the simulation as well as in the real world. -->
+    <!-- N20 12V 150:1 (1.2 kg*cm stall, 200 rpm no-load @ 12V) on a 3S LiPo (11.1V nominal).
+         DC motor model: torque = kv * (ctrl - wheel_vel), kv = stall torque / no-load speed
+         = 0.1177 Nm / 20.94 rad/s = 0.00562 (independent of supply voltage).
+         Stall torque and no-load speed scale with voltage: at 11.1V -> 0.109 Nm, 19.4 rad/s.
+         ctrl = PWM duty * 19.4 rad/s. forcerange = stall torque at 11.1V. -->
+    <actuator>
+        <velocity name="motor_l_wheel" joint="left_wheel_joint" ctrllimited="true" ctrlrange="-19.4 19.4" kv="0.00562" forcelimited="true" forcerange="-0.109 0.109"/>
+        <velocity name="motor_r_wheel" joint="right_wheel_joint" ctrllimited="true" ctrlrange="-19.4 19.4" kv="0.00562" forcelimited="true" forcerange="-0.109 0.109"/>
+    </actuator>
+
+    <sensor>
+        <!-- IMU -->
+        <accelerometer name="imu_accel" site="imu_site"/>
+        <gyro name="imu_gyro" site="imu_site"/>
+        <framequat name="imu_orientation" objtype="site" objname="imu_site"/>
+        <!-- Note that we don't have access to the orientation on the real robot, just the rate -->
+        <!-- Wheel encoders (joint position and velocity) -->
+        <jointpos name="left_wheel_pos" joint="left_wheel_joint"/>
+        <jointpos name="right_wheel_pos" joint="right_wheel_joint"/>
+        <jointvel name="left_wheel_vel" joint="left_wheel_joint"/>
+        <jointvel name="right_wheel_vel" joint="right_wheel_joint"/>
+    </sensor>
+</mujoco>
