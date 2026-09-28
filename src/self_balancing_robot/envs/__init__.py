@@ -1,5 +1,13 @@
 """MuJoCo environments for the self-balancing robot."""
 
-from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
+import gymnasium as gym
 
-__all__ = ["SelfBalancingRobotEnv"]
+from self_balancing_robot.envs.minigoose_env import MiniGooseEnv
+from self_balancing_robot.config.config import MiniGooseEnvConfig
+
+gym.register(
+    id="MiniGoose-Balance-v0",
+    entry_point="self_balancing_robot.envs.minigoose_env:MiniGooseEnv",
+)
+
+__all__ = ["MiniGooseEnvConfig", "MiniGooseEnv"]
