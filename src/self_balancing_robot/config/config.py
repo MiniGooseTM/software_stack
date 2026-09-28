@@ -11,7 +11,7 @@ class MiniGooseEnvConfig:
     # Termination / episode
     max_tilt: float = 0.6  # rad from upright before the episode ends
     max_episode_steps: int = 2000  # truncation limit in control steps
-    init_pitch_range: float = 0.1  # starting pitch is uniform in [-init_pitch_range, init_pitch_range] rad
+    init_tilt_range: float = 0.1  # starting pitch is uniform in [-init_tilt_range, init_tilt_range] rad
 
     # Reward weights
     alive_bonus: float = 1.0
@@ -33,4 +33,3 @@ class MiniGooseEnvConfig:
 
     # Actuator noise
     action_noise_std: float = 0.0  # in normalized action units [-1, 1]
-    action_delay_steps: int = 0  # control steps between policy output and motor command

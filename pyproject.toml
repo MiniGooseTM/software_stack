@@ -27,7 +27,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-self_balancing_robot = ["assets/*.xml"]
+self_balancing_robot = ["assets/*.xml", "assets/meshes/*.stl"]
 
 [tool.ruff]
 line-length = 100
