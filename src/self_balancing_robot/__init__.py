@@ -1,5 +1,5 @@
 """Self-balancing robot simulation and training package."""
 
-from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
+from self_balancing_robot.envs import MiniGooseEnv, MiniGooseEnvConfig
 
-__all__ = ["SelfBalancingRobotEnv"]
+__all__ = ["MiniGooseEnv", "MiniGooseEnvConfig"]

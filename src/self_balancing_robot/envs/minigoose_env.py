@@ -1,4 +1,10 @@
-from collections import deque
+"""
+MiniGoose gymnasium environment.
+
+Inspired by premade MuJoCo environments from Gymnasium GitHub, such as https://github.com/openai/gym/blob/master/gym/envs/mujoco/ant_v4.py
+"""
+
+
 from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
@@ -36,6 +42,7 @@ class MiniGooseEnv(MujocoEnv, gym.utils.EzPickle):
 
     metadata: ClassVar = {
         "render_modes": ["human", "rgb_array", "depth_array"],
+        "render_fps": int(round(1 /(TIMESTEP * FRAME_SKIP))),
     }
 
     def __init__(
@@ -76,6 +83,7 @@ class MiniGooseEnv(MujocoEnv, gym.utils.EzPickle):
 
         # initialize internal variables
         self._tilt = 0
+        self._ctrl_range = self.model.actuator_ctrlrange[:, 1] # max control value for each actuator (assuming symmetric range)
         self._prev_action = np.zeros(2)
         self._init_xy = np.zeros(2)
         self._steps = 0
@@ -91,7 +99,10 @@ class MiniGooseEnv(MujocoEnv, gym.utils.EzPickle):
         # calculate tilt
         # TODO: check if the sign and axis is correct (rn we calculate roll as the tilt)
         tilt_from_accel = np.arctan2(accel_y, accel_z) # assumes that the accelerometer only measures gravity
-        self._tilt = self.cfg.alpha * (self._tilt + roll_rate * self.model.opt.timestep) + (1 - self.cfg.alpha) * tilt_from_accel
+        if np.linalg.norm([accel_y, accel_z]) < 1e-6:
+            # avoid NaN when the robot is in free fall (accel ~ 0)
+            tilt_from_accel = self._tilt
+        self._tilt = self.cfg.alpha * (self._tilt + roll_rate * self.dt) + (1 - self.cfg.alpha) * tilt_from_accel
 
         obs = np.array([self._tilt, roll_rate, left_wheel_vel, right_wheel_vel])
         return obs # tilt, tilt rate, left wheel velocity, right wheel velocity
@@ -105,11 +116,12 @@ class MiniGooseEnv(MujocoEnv, gym.utils.EzPickle):
         qpos = self.init_qpos.copy()
         qvel = self.init_qvel + self.np_random.uniform(-0.01, 0.01, size=self.model.nv) # start with small random velocity
         # The axle passes through the base origin, so tilting about it keeps the wheels on the ground
-        tilt = self.np_random.uniform(-self.cfg.init_pitch_range, self.cfg.init_tilt_range)
+        tilt = self.np_random.uniform(-self.cfg.init_tilt_range, self.cfg.init_tilt_range)
         mujoco.mju_axisAngle2Quat(qpos[3:7], np.array([1.0, 0.0, 0.0]), tilt)
         self.set_state(qpos, qvel)
 
-        self._tilt = tilt
+        # TODO: maybe initialize using the accelerometer
+        self._tilt = 0 
         self._init_xy = qpos[:2].copy()
         self._prev_action = np.zeros(2)
         self._steps = 0
@@ -119,7 +131,8 @@ class MiniGooseEnv(MujocoEnv, gym.utils.EzPickle):
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         # add noise to actions
         noisy_action = action + self.np_random.normal(0.0, self.cfg.action_noise_std, size=2)
-        self.do_simulation(noisy_action, self.frame_skip)
+        ctrl = np.clip( noisy_action * self._ctrl_range, -self._ctrl_range, self._ctrl_range)
+        self.do_simulation(ctrl, self.frame_skip)
         self._steps += 1
 
         observation = self._get_obs()
@@ -135,7 +148,7 @@ class MiniGooseEnv(MujocoEnv, gym.utils.EzPickle):
         pitch_rate = float(self.data.qvel[4]) 
         yaw_rate = float(self.data.qvel[5]) 
         # speed and velocity
-        velocity = float(np.dot(R, self.data.qvel[:3]))
+        velocity = np.dot(R.T, self.data.qvel[:3])  # body frame linear velocity
         distance = float(np.linalg.norm(self.data.qpos[:2] - self._init_xy))
 
         tilt = roll
@@ -145,17 +158,17 @@ class MiniGooseEnv(MujocoEnv, gym.utils.EzPickle):
             "alive": self.cfg.alive_bonus,
             "tilt": -self.cfg.w_tilt * tilt**2,
             "tilt_rate": -self.cfg.w_tilt_rate * tilt_rate**2,
-            "velocity": -self.cfg.w_velocity * float(np.square(velocity).sum()),
+            "velocity": -self.cfg.w_velocity * float(np.square(velocity[:2]).sum()),
             "distance": -self.cfg.w_distance * distance**2,
             "action": -self.cfg.w_action * float(np.square(action).sum()),
             "action_rate": -self.cfg.w_action_rate
             * float(np.square(action - self._prev_action).sum()),
         }
         reward = float(sum(reward_terms.values()))
-        self._prev_action = noisy_action
 
         terminated = abs(tilt) > self.cfg.max_tilt
         truncated = self._steps >= self.cfg.max_episode_steps
+        self._prev_action = action
 
         if self.render_mode == "human":
             self.render()
