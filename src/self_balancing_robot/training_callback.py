@@ -21,6 +21,7 @@ class BalanceErrorCallback(BaseCallback):
         n_eval_episodes: int = DEFAULT_TRAINING_CONFIG.evaluation_episodes,
         max_eval_steps: int = DEFAULT_TRAINING_CONFIG.evaluation_max_steps,
         seed: int = 0,
+        plot_path: Path | None = None,
     ):
         super().__init__()
         if eval_freq <= 0:
@@ -34,6 +35,9 @@ class BalanceErrorCallback(BaseCallback):
         self.n_eval_episodes = n_eval_episodes
         self.max_eval_steps = max_eval_steps
         self.seed = seed
+        self.plot_path = plot_path or (
+            Path(__file__).resolve().parents[1] / DEFAULT_TRAINING_CONFIG.training_plot_path
+        )
         self.eval_env = SelfBalancingRobotEnv()
         self.train_steps: list[int] = []
         self.train_errors: list[float] = []
@@ -42,6 +46,16 @@ class BalanceErrorCallback(BaseCallback):
         self._train_error_sum = 0.0
         self._train_observation_count = 0
         self._next_eval_step = eval_freq
+
+    def _on_training_start(self) -> None:
+        self.train_steps.clear()
+        self.train_errors.clear()
+        self.test_steps.clear()
+        self.test_errors.clear()
+        self._train_error_sum = 0.0
+        self._train_observation_count = 0
+        self._next_eval_step = self.eval_freq
+        self._save_plot()
 
     def _on_step(self) -> bool:
         observations = np.asarray(self.locals["new_obs"])
@@ -68,12 +82,15 @@ class BalanceErrorCallback(BaseCallback):
 
         self.test_steps.append(self.num_timesteps)
         self.test_errors.append(self._evaluate_test_error())
+        self._save_plot()
+
+    def _save_plot(self) -> None:
         save_training_plot(
             self.train_steps,
             self.train_errors,
             self.test_steps,
             self.test_errors,
-            Path(__file__).resolve().parents[1] / DEFAULT_TRAINING_CONFIG.training_plot_path,
+            self.plot_path,
         )
 
     def _evaluate_test_error(self) -> float:

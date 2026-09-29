@@ -3,6 +3,7 @@ import numpy as np
 from self_balancing_robot import SelfBalancingRobotEnv
 from self_balancing_robot.config import EnvironmentConfig
 from self_balancing_robot.envs.balance_env import RewardConfig
+from self_balancing_robot.training_callback import BalanceErrorCallback
 
 
 def test_environment_reset_and_step():
@@ -11,6 +12,11 @@ def test_environment_reset_and_step():
     assert observation.shape == (12,)
     assert env.observation_space.contains(observation)
     assert info == {}
+    left_wheel_geom_id = env.model.geom("left_wheel_geom").id
+    wheel_bottom = (
+        env.data.geom_xpos[left_wheel_geom_id, 2] - env.model.geom_size[left_wheel_geom_id, 0]
+    )
+    assert abs(wheel_bottom) < 1e-3
 
     next_observation, reward, terminated, truncated, info = env.step(np.zeros(2, dtype=np.float32))
     assert next_observation.shape == (12,)
@@ -24,12 +30,44 @@ def test_environment_reset_and_step():
     env.close()
 
 
+def test_unpowered_robot_falls_without_wheel_torque():
+    env = SelfBalancingRobotEnv()
+    env.reset(seed=0)
+
+    for _ in range(int(1.5 / env.dt)):
+        _, _, terminated, truncated, info = env.step(np.zeros(2, dtype=np.float32))
+        if terminated or truncated:
+            break
+
+    assert terminated
+    assert not truncated
+    assert info["terminated_reason"] == "pitch_failure"
+    env.close()
+
+
 def test_render_fps_uses_the_simulation_timestep_and_frame_skip():
     env = SelfBalancingRobotEnv(environment_config=EnvironmentConfig(frame_skip=2))
     assert env.frame_skip == 2
     assert env.metadata["render_fps"] == int(np.round(1.0 / env.dt))
     assert "render_fps" not in SelfBalancingRobotEnv.metadata
     env.close()
+
+
+def test_training_start_replaces_old_plot_with_current_run(tmp_path):
+    plot_path = tmp_path / "training_errors.png"
+    plot_path.write_bytes(b"stale plot")
+    callback = BalanceErrorCallback(plot_path=plot_path)
+    callback.train_steps.append(100)
+    callback.train_errors.append(0.5)
+    callback.test_steps.append(100)
+    callback.test_errors.append(0.4)
+
+    callback._on_training_start()
+    callback.eval_env.close()
+
+    assert plot_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert not callback.train_steps
+    assert not callback.test_steps
 
 
 def test_reward_components_follow_configured_weights():

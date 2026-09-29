@@ -98,6 +98,10 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         self._track_width = abs(
             self.model.body_pos[left_wheel_id, 1] - self.model.body_pos[right_wheel_id, 1]
         )
+        joint_names = ("x_slide", "pitch", "left_wheel_hinge", "right_wheel_hinge")
+        joint_ids = [self.model.joint(name).id for name in joint_names]
+        self._qpos_indices = self.model.jnt_qposadr[joint_ids]
+        self._qvel_indices = self.model.jnt_dofadr[joint_ids]
 
     def _initialize_simulation(self):
         model, data = super()._initialize_simulation()
@@ -118,7 +122,9 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         return self._command.copy()
 
     def _get_true_kinematics(self) -> tuple[np.ndarray, float, float, float, float]:
-        observation = np.concatenate((self.data.qpos[:4], self.data.qvel[:4]))
+        observation = np.concatenate(
+            (self.data.qpos[self._qpos_indices], self.data.qvel[self._qvel_indices])
+        )
         position, pitch = observation[:2]
         linear_velocity, _pitch_rate = observation[4:6]
         wheel_left_velocity, wheel_right_velocity = observation[6:8]
