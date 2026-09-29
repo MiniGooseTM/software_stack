@@ -41,7 +41,7 @@ class RandomizationConfig:
     max_latency_steps: int = 2
     observation_noise: float = 0.002
     impulse_interval_seconds: tuple[float, float] = (2.0, 4.0)
-    impulse_force: float = 2.0
+    impulse_force: float = 0.2
 
 
 class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
@@ -72,7 +72,7 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         MujocoEnv.__init__(
             self,
             model_path=str(xml_path),
-            frame_skip=5,
+            frame_skip=3,
             observation_space=spaces.Box(-np.inf, np.inf, shape=(12,), dtype=np.float64),
             default_camera_config={"distance": 2.5, "elevation": -15, "azimuth": 90},
             render_mode=render_mode,
