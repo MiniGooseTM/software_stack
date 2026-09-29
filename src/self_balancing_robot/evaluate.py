@@ -20,9 +20,13 @@ def main() -> None:
         total_reward = 0.0
         while not (terminated or truncated):
             action, _ = model.predict(observation, deterministic=True)
-            observation, reward, terminated, truncated, _ = env.step(action)
+            observation, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
-        print(f"episode={episode + 1} reward={total_reward:.2f}")
+        print(
+            f"episode={episode + 1} reward={total_reward:.2f} "
+            f"stage={info['curriculum_stage']} pitch={info['pitch']:.3f} "
+            f"v_error={abs(info['linear_velocity'] - info['v_cmd']):.3f}"
+        )
     env.close()
 
 

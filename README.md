@@ -1,6 +1,6 @@
 # Self-balancing robot software stack
 
-This repository contains the first simulation and reinforcement-learning setup for a homemade two-wheel self-balancing robot. The current model is planar: PPO controls two wheel motors and observes chassis pose/velocity, with the goal of keeping the chassis pitch near zero and following velocity commands.
+This repository contains the first simulation and reinforcement-learning setup for a homemade two-wheel self-balancing robot. The current model is planar: PPO controls two wheel motors and observes chassis pose/velocity, commanded linear and angular velocity, and previous motor actions. The unified reward combines survival, pitch posture, command tracking, effort, and action smoothness.
 
 ## University cluster
 Open the university cluster https://gpu1.eecs.kth.se/user/{USER} and in the terminal run
@@ -50,9 +50,9 @@ On an Ubuntu host with an NVIDIA runtime, use `Dockerfile.gpu` and add `--gpus a
 ## Project layout
 
 - `src/self_balancing_robot/assets/self_balancing_robot.xml`: initial MuJoCo model.
-- `src/self_balancing_robot/envs/balance_env.py`: Gymnasium environment and reward.
+- `src/self_balancing_robot/envs/balance_env.py`: Gymnasium environment, unified reward, command curriculum, and stage-four randomization.
 - `src/self_balancing_robot/train.py`: vectorized PPO training entry point.
 - `src/self_balancing_robot/evaluate.py`: visual evaluation entry point.
 - `tests/`: environment smoke tests.
 
-The XML is intentionally a starting point. Before transferring a policy to hardware, replace dimensions, masses, friction, actuator limits, and sensor observations with measured robot values and add domain randomization.
+The XML is intentionally a starting point. The environment implements four curriculum stages: upright stabilization, micro-mobility, full command tracking, and domain randomization/disturbance recovery. Before transferring a policy to hardware, replace dimensions, masses, friction, actuator limits, sensor observations, latency, and safety thresholds with measured robot values. Collect synchronized IMU, encoder, command, motor, battery, and fall-event logs to calibrate the model and define validation targets.
