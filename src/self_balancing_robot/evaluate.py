@@ -3,13 +3,18 @@ from pathlib import Path
 
 from stable_baselines3 import PPO
 
+from self_balancing_robot.config import DEFAULT_TRAINING_CONFIG
 from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a trained balancing policy.")
-    parser.add_argument("--model", type=Path, default=Path("models/ppo_balance.zip"))
-    parser.add_argument("--episodes", type=int, default=5)
+    parser.add_argument(
+        "--model", type=Path, default=DEFAULT_TRAINING_CONFIG.evaluation_model_path
+    )
+    parser.add_argument(
+        "--episodes", type=int, default=DEFAULT_TRAINING_CONFIG.evaluation_episodes
+    )
     parser.add_argument(
         "--render",
         action="store_true",

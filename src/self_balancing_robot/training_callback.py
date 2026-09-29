@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
+from self_balancing_robot.config import DEFAULT_TRAINING_CONFIG
 from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
 
 
@@ -16,9 +17,9 @@ class BalanceErrorCallback(BaseCallback):
 
     def __init__(
         self,
-        eval_freq: int = 10_000,
-        n_eval_episodes: int = 5,
-        max_eval_steps: int = 1_000,
+        eval_freq: int = DEFAULT_TRAINING_CONFIG.evaluation_frequency,
+        n_eval_episodes: int = DEFAULT_TRAINING_CONFIG.evaluation_episodes,
+        max_eval_steps: int = DEFAULT_TRAINING_CONFIG.evaluation_max_steps,
         seed: int = 0,
     ):
         super().__init__()
@@ -72,7 +73,7 @@ class BalanceErrorCallback(BaseCallback):
             self.train_errors,
             self.test_steps,
             self.test_errors,
-            Path(__file__).resolve().parents[1] / "plots" / "training_errors.png",
+            Path(__file__).resolve().parents[1] / DEFAULT_TRAINING_CONFIG.training_plot_path,
         )
 
     def _evaluate_test_error(self) -> float:

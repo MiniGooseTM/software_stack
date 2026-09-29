@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
@@ -10,38 +9,17 @@ import numpy as np
 from gymnasium import spaces
 from gymnasium.envs.mujoco import MujocoEnv
 
-
-@dataclass(frozen=True)
-class RewardConfig:
-    alive_weight: float = 2.0
-    pitch_weight: float = 0.5
-    linear_velocity_weight: float = 1.5
-    angular_velocity_weight: float = 1.0
-    action_weight: float = 0.01
-    smoothness_weight: float = 0.05
-    pitch_variance: float = 0.05
-    linear_velocity_variance: float = 0.25
-    angular_velocity_variance: float = 0.5
-
-
-@dataclass(frozen=True)
-class CurriculumConfig:
-    command_resample_seconds: tuple[float, float] = (3.0, 5.0)
-    stage1_timeout_success_rate: float = 0.95
-    stage2_linear_error_threshold: float = 0.01
-    evaluation_window: int = 20
-
-
-@dataclass(frozen=True)
-class RandomizationConfig:
-    mass_fraction: float = 0.10
-    center_of_mass_fraction: float = 0.10
-    friction_fraction: float = 0.20
-    slope_radians: float = 0.05
-    max_latency_steps: int = 2
-    observation_noise: float = 0.002
-    impulse_interval_seconds: tuple[float, float] = (2.0, 4.0)
-    impulse_force: float = 0.2
+from self_balancing_robot.config import (
+    DEFAULT_CURRICULUM_CONFIG,
+    DEFAULT_ENVIRONMENT_CONFIG,
+    DEFAULT_RANDOMIZATION_CONFIG,
+    DEFAULT_REWARD_CONFIG,
+    CurriculumConfig,
+    CurriculumStage,
+    EnvironmentConfig,
+    RandomizationConfig,
+    RewardConfig,
+)
 
 
 class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
@@ -49,7 +27,6 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
 
     metadata: ClassVar = {
         "render_modes": ["human", "rgb_array", "depth_array"],
-        "render_fps": 50,
     }
 
     def __init__(
@@ -58,7 +35,8 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         reward_config: RewardConfig | None = None,
         curriculum_config: CurriculumConfig | None = None,
         randomization_config: RandomizationConfig | None = None,
-        max_episode_steps: int = 1_000,
+        environment_config: EnvironmentConfig | None = None,
+        max_episode_steps: int | None = None,
     ):
         gym.utils.EzPickle.__init__(
             self,
@@ -66,25 +44,35 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
             reward_config,
             curriculum_config,
             randomization_config,
+            environment_config,
             max_episode_steps,
+        )
+        self.environment_config = environment_config or DEFAULT_ENVIRONMENT_CONFIG
+        self.max_episode_steps = (
+            max_episode_steps
+            if max_episode_steps is not None
+            else self.environment_config.max_episode_steps
         )
         xml_path = Path(__file__).parents[1] / "assets" / "self_balancing_robot.xml"
         MujocoEnv.__init__(
             self,
             model_path=str(xml_path),
-            frame_skip=3,
+            frame_skip=self.environment_config.frame_skip,
             observation_space=spaces.Box(-np.inf, np.inf, shape=(12,), dtype=np.float64),
-            default_camera_config={"distance": 2.5, "elevation": -15, "azimuth": 90},
+            default_camera_config={
+                "distance": self.environment_config.camera_distance_m,
+                "elevation": self.environment_config.camera_elevation_degrees,
+                "azimuth": self.environment_config.camera_azimuth_degrees,
+            },
             render_mode=render_mode,
         )
         self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
-        self.reward_config = reward_config or RewardConfig()
-        self.curriculum_config = curriculum_config or CurriculumConfig()
-        self.randomization_config = randomization_config or RandomizationConfig()
-        self.max_episode_steps = max_episode_steps
-        self._upright_limit = 0.6
-        self._max_position = 3.0
-        self._stage = 1
+        self.reward_config = reward_config or DEFAULT_REWARD_CONFIG
+        self.curriculum_config = curriculum_config or DEFAULT_CURRICULUM_CONFIG
+        self.randomization_config = randomization_config or DEFAULT_RANDOMIZATION_CONFIG
+        self._upright_limit = self.environment_config.upright_limit_radians
+        self._max_position = self.environment_config.max_position_m
+        self._stage = CurriculumStage.STABILIZATION
         self._episode_step = 0
         self._command_time_remaining = 0.0
         self._next_impulse_time = np.inf
@@ -104,8 +92,22 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         self._nominal_mass = self.model.body_mass[self._chassis_body_id]
         self._nominal_friction = self.model.geom_friction.copy()
         self._nominal_ground_quat = self.model.geom_quat[self._ground_geom_id].copy()
-        self._wheel_radius = 0.16
-        self._track_width = 0.32
+        self._wheel_radius = self.model.geom_size[self.model.geom("left_wheel_geom").id, 0]
+        left_wheel_id = self.model.body("left_wheel").id
+        right_wheel_id = self.model.body("right_wheel").id
+        self._track_width = abs(
+            self.model.body_pos[left_wheel_id, 1] - self.model.body_pos[right_wheel_id, 1]
+        )
+
+    def _initialize_simulation(self):
+        model, data = super()._initialize_simulation()
+        self.metadata = {
+            **type(self).metadata,
+            "render_fps": int(
+                np.round(1.0 / (model.opt.timestep * self.environment_config.frame_skip))
+            ),
+        }
+        return model, data
 
     @property
     def curriculum_stage(self) -> int:
@@ -132,22 +134,28 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         result = np.concatenate((observation, self._command, self._previous_action)).astype(
             np.float64
         )
-        if noisy and self._stage >= 4 and self.randomization_config.observation_noise > 0:
+        if (
+            noisy
+            and self._stage >= CurriculumStage.DOMAIN_RANDOMIZATION
+            and self.randomization_config.observation_noise > 0
+        ):
             result[:8] += self.np_random.normal(
                 0.0, self.randomization_config.observation_noise, size=8
             )
         return result
 
     def _sample_command(self) -> None:
-        if self._stage == 1:
+        if self._stage == CurriculumStage.STABILIZATION:
             self._command[:] = 0.0
-        elif self._stage == 2:
+        elif self._stage == CurriculumStage.MICRO_MOBILITY:
+            linear_limit, angular_limit = self.curriculum_config.stage2_command_limits
             self._command[:] = self.np_random.uniform(
-                [-0.05, -0.3], [0.05, 0.3], size=2
+                [-linear_limit, -angular_limit], [linear_limit, angular_limit], size=2
             )
         else:
+            linear_limit, angular_limit = self.curriculum_config.stage3_command_limits
             self._command[:] = self.np_random.uniform(
-                [-0.3, -1.0], [0.3, 1.0], size=2
+                [-linear_limit, -angular_limit], [linear_limit, angular_limit], size=2
             )
         self._command_time_remaining = self.np_random.uniform(
             *self.curriculum_config.command_resample_seconds
@@ -158,15 +166,15 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         self.model.body_pos[self._chassis_body_id] = self._nominal_body_pos
         self.model.geom_friction[:] = self._nominal_friction
         self.model.geom_quat[self._ground_geom_id] = self._nominal_ground_quat
-        if self._stage < 4:
+        if self._stage < CurriculumStage.DOMAIN_RANDOMIZATION:
             return
         cfg = self.randomization_config
         self.model.body_mass[self._chassis_body_id] *= self.np_random.uniform(
             1.0 - cfg.mass_fraction, 1.0 + cfg.mass_fraction
         )
         self.model.body_pos[self._chassis_body_id, :2] += self.np_random.uniform(
-            -cfg.center_of_mass_fraction, cfg.center_of_mass_fraction, size=2
-        ) * 0.1
+            -cfg.center_of_mass_offset_m, cfg.center_of_mass_offset_m, size=2
+        )
         friction_scale = self.np_random.uniform(
             1.0 - cfg.friction_fraction, 1.0 + cfg.friction_fraction
         )
@@ -190,7 +198,7 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
                     0, self.randomization_config.max_latency_steps + 1
                 )
             )
-            if self._stage >= 4
+            if self._stage >= CurriculumStage.DOMAIN_RANDOMIZATION
             else 0
         )
         self._episode_linear_error = 0.0
@@ -199,8 +207,18 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
             *self.randomization_config.impulse_interval_seconds
         )
         self.set_state(
-            self.init_qpos + self.np_random.uniform(-0.02, 0.02, size=self.model.nq),
-            self.init_qvel + self.np_random.uniform(-0.02, 0.02, size=self.model.nv),
+            self.init_qpos
+            + self.np_random.uniform(
+                -self.environment_config.initial_state_noise,
+                self.environment_config.initial_state_noise,
+                size=self.model.nq,
+            ),
+            self.init_qvel
+            + self.np_random.uniform(
+                -self.environment_config.initial_state_noise,
+                self.environment_config.initial_state_noise,
+                size=self.model.nv,
+            ),
         )
         return self._get_obs()
 
@@ -212,7 +230,10 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         return False
 
     def _apply_disturbance_if_due(self) -> None:
-        if self._stage < 4 or self._episode_step * self.dt < self._next_impulse_time:
+        if (
+            self._stage < CurriculumStage.DOMAIN_RANDOMIZATION
+            or self._episode_step * self.dt < self._next_impulse_time
+        ):
             return
         force = self.np_random.uniform(
             -self.randomization_config.impulse_force,
@@ -225,14 +246,14 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         )
 
     def _advance_curriculum(self, episode_success: bool) -> None:
-        if self._stage == 1:
+        if self._stage == CurriculumStage.STABILIZATION:
             self._stage_results.append(episode_success)
             if (
                 len(self._stage_results) == self._stage_results.maxlen
                 and np.mean(self._stage_results) >= self.curriculum_config.stage1_timeout_success_rate
             ):
-                self._stage = 2
-        elif self._stage == 2:
+                self._stage = CurriculumStage.MICRO_MOBILITY
+        elif self._stage == CurriculumStage.MICRO_MOBILITY:
             self._stage2_errors.append(
                 self._episode_linear_error / max(self._episode_steps_for_metrics, 1)
             )
@@ -241,14 +262,14 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
                 and np.mean(self._stage2_errors)
                 < self.curriculum_config.stage2_linear_error_threshold
             ):
-                self._stage = 3
+                self._stage = CurriculumStage.COMMAND_TRACKING
 
     def step(self, action: np.ndarray):
         action = np.asarray(np.clip(action, self.action_space.low, self.action_space.high))
         self._action_queue.append(action.astype(np.float32))
         if not self._action_queue:
             applied_action = action
-        elif self._stage >= 4:
+        elif self._stage >= CurriculumStage.DOMAIN_RANDOMIZATION:
             while len(self._action_queue) <= self._latency_steps:
                 self._action_queue.appendleft(np.zeros(2, dtype=np.float32))
             applied_action = self._action_queue.popleft()
@@ -325,4 +346,4 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         return self._get_obs(), float(reward), terminated, truncated, info
 
     def viewer_setup(self) -> None:
-        self.viewer.cam.distance = 2.5
+        self.viewer.cam.distance = self.environment_config.camera_distance_m

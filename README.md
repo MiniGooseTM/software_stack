@@ -33,7 +33,9 @@ make train
 The trained policy is saved to `models/ppo_balance.zip`; TensorBoard logs are written to `logs/`.
 Training also evaluates mean absolute pitch error on held-out episodes and saves the train/test
 error graph to `src/plots/training_errors.png`. Evaluation frequency and episode count can be
-changed with `--eval-freq` and `--eval-episodes`.
+changed with `--eval-freq` and `--eval-episodes`. Shared defaults are in
+`src/self_balancing_robot/config.py`; MuJoCo model and geometry values are defined in the XML.
+Pass extra options to `make train` or `make evaluate` with `TRAIN_ARGS` or `EVALUATE_ARGS`.
 
 ## Docker
 There's no need for docker in the University Cluster. However it is available in case the cluster isn't.
@@ -42,7 +44,7 @@ The default image is CPU-only and works on macOS Docker Desktop and Ubuntu:
 ```bash
 docker build -t self-balancing-robot .
 docker run --rm -v "$PWD/models:/app/models" -v "$PWD/logs:/app/logs" \
-  self-balancing-robot --timesteps 100000
+  self-balancing-robot
 ```
 
 On an Ubuntu host with an NVIDIA runtime, use `Dockerfile.gpu` and add `--gpus all` to the run command. Training is headless; `MUJOCO_GL=egl` is set in both images.

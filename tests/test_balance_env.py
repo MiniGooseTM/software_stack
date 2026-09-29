@@ -1,6 +1,7 @@
 import numpy as np
 
 from self_balancing_robot import SelfBalancingRobotEnv
+from self_balancing_robot.config import EnvironmentConfig
 from self_balancing_robot.envs.balance_env import RewardConfig
 
 
@@ -20,6 +21,14 @@ def test_environment_reset_and_step():
     assert info["curriculum_stage"] == 1
     assert info["v_cmd"] == 0.0
     assert "reward_linear_velocity" in info
+    env.close()
+
+
+def test_render_fps_uses_the_simulation_timestep_and_frame_skip():
+    env = SelfBalancingRobotEnv(environment_config=EnvironmentConfig(frame_skip=2))
+    assert env.frame_skip == 2
+    assert env.metadata["render_fps"] == int(np.round(1.0 / env.dt))
+    assert "render_fps" not in SelfBalancingRobotEnv.metadata
     env.close()
 
 

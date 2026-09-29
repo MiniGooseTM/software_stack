@@ -9,10 +9,10 @@ install:
 	$(VENV)/bin/python -m pip install -e ".[dev]"
 
 train:
-	$(VENV)/bin/python -m self_balancing_robot.train --timesteps 100000
+	$(VENV)/bin/python -m self_balancing_robot.train $(TRAIN_ARGS)
 
 evaluate:
-	$(VENV)/bin/python -m self_balancing_robot.evaluate --model models/ppo_balance.zip --episodes 5
+	$(VENV)/bin/python -m self_balancing_robot.evaluate $(EVALUATE_ARGS)
 
 test:
 	$(VENV)/bin/python -m pytest
