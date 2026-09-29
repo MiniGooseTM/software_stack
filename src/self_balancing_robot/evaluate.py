@@ -10,9 +10,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a trained balancing policy.")
     parser.add_argument("--model", type=Path, default=Path("models/ppo_balance.zip"))
     parser.add_argument("--episodes", type=int, default=5)
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="Show the MuJoCo viewer (requires a graphical display).",
+    )
     args = parser.parse_args()
 
-    env = SelfBalancingRobotEnv(render_mode="human")
+    env = SelfBalancingRobotEnv(render_mode="human" if args.render else None)
     model = PPO.load(args.model, env=env)
     for episode in range(args.episodes):
         observation, _ = env.reset()
