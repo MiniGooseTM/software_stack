@@ -1,6 +1,6 @@
 # Self-balancing robot software stack
 
-This repository contains the first simulation and reinforcement-learning setup for a homemade two-wheel self-balancing robot. The current model is planar: PPO controls two wheel motors and observes chassis pose/velocity, with the goal of keeping the chassis pitch near zero.
+This repository contains the first simulation and reinforcement-learning setup for a homemade two-wheel self-balancing robot. The current model is planar: PPO controls two wheel motors and observes chassis pose/velocity, with the goal of keeping the chassis pitch near zero and following velocity commands.
 
 ## Quick start with a Python virtual environment
 
