@@ -35,3 +35,18 @@ On an Ubuntu host with an NVIDIA runtime, use `Dockerfile.gpu` and add `--gpus a
 - `tests/`: environment smoke tests.
 
 The XML is intentionally a starting point. Before transferring a policy to hardware, replace dimensions, masses, friction, actuator limits, and sensor observations with measured robot values and add domain randomization.
+
+
+## To access in University Cluster
+```bash
+ssh-keygen -t ed25519 -C "gpu-server"
+cat ~/.ssh/id_ed25519.pub
+```
+add that as a PAT and then run
+```bash
+ssh -T git@github.com
+```
+you will get a message saying you've successfully authenticated, then feel free to clone
+```bash
+git clone git@github.com:MiniGooseTM/software_stack.git
+```
