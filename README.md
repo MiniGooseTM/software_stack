@@ -31,6 +31,9 @@ make train
 ```
 
 The trained policy is saved to `models/ppo_balance.zip`; TensorBoard logs are written to `logs/`.
+Training also evaluates mean absolute pitch error on held-out episodes and saves the train/test
+error graph to `src/plots/training_errors.png`. Evaluation frequency and episode count can be
+changed with `--eval-freq` and `--eval-episodes`.
 
 ## Docker
 There's no need for docker in the University Cluster. However it is available in case the cluster isn't.
