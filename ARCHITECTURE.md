@@ -6,18 +6,26 @@ This document outlines two training pipelines for a highly efficient, propriocep
 
 ### 1.1 The Action Space ($A_t$)
 *   **Dimensions:** 2
-*   **Vector:** $[v_{left\_motor\_cmd}, v_{right\_motor\_cmd}]$ normalized to $[-1, 1]$.
+*   **Vector:** $[pwm_{left}, pwm_{right}]$ normalized to $[-1, 1]$.
+*   **Meaning:** Each output is a signed motor command. `-1` means full reverse,
+    `0` means zero command, and `+1` means full forward. The policy output is
+    therefore not a PWM timer count or a voltage in volts; it is a dimensionless
+    normalized command that is converted to hardware-specific PWM duty cycle at
+    deployment time.
 
 ### 1.2 The Privileged State ($S_t$) - Teacher/Critic Only
 Used exclusively during simulation training. It is fully Markovian (no history window) because it contains exact physical truths.
-*   **Proprioceptive Core:** $v_{x, cmd}, \omega_{z, cmd}$, Pitch, Pitch Rate, Yaw Rate, Left/Right wheel velocities, $a_{t-1}$.
-*   **Privileged Variables:** Exact Center of Mass (CoM) offset $(x, y, z)$, exact floor friction coefficient, current external push forces $(F_x, F_y, F_z)$, exact motor delay/lag.
+*   **Proprioceptive Core:** the same 11 states as $O_t$ (see 1.3), but noise-free and without sensor latency, plus the true forward and lateral chassis velocity.
+*   **Privileged Variables:** Exact Center of Mass (CoM) offset $(x, y, z)$, chassis mass deviation, floor friction deviation, current external push force $(F_{forward}, F_{lateral})$ in the robot's heading frame, motor/IMU/encoder latency, and terrain slope $(forward, lateral)$. All are normalized to roughly $[-1, 1]$ by their randomization range.
+*   **Size:** 25 (`PRIVILEGED_FIELDS` in `envs/balance_env.py`).
 
 ### 1.3 The Proprioceptive History ($O_t$) - Student/Actor Only
 Used by the ESP32 to infer the privileged variables implicitly. 
-*   **Base Observation:** 11 states (Commands, IMU rates/angles, Wheel velocities, previous actions).
-*   **Temporal Window:** $H = 5$ to $10$ frames.
-*   **Input Vector:** Concatenated history $[O_t, O_{t-1}, ..., O_{t-H}]$ resulting in an input size of $11 \times H$.
+*   **Base Observation:** 11 states, in this order (`ACTOR_FRAME_FIELDS` in `envs/balance_env.py`):
+    $[v_{x,cmd}, \omega_{z,cmd}, roll, pitch, \dot{roll}, \dot{pitch}, \dot{yaw}, \omega_{L}, \omega_{R}, a_{L,t-1}, a_{R,t-1}]$.
+    Commands divided by the full command range ($v_{x,cmd} / 0.3$ m/s, $\omega_{z,cmd} / 1.5$ rad/s, so in $[-1, 1]$; the joystick command must first be limited so the outer wheel needs at most 0.3 m/s, as in training), angles in rad (IMU attitude estimate), rates in rad/s (gyro, body frame), wheel velocities divided by the motor no-load speed (19.4 rad/s), and $a_{t-1}$ is the policy's own previous output.
+*   **Temporal Window:** $H = 8$ frames (`EnvironmentConfig.history_length`, keep within 5 to 10).
+*   **Input Vector:** Concatenated history $[O_t, O_{t-1}, ..., O_{t-H+1}]$, newest first, resulting in an input size of $11 \times H = 88$. At startup the window is filled with copies of the first frame.
 
 ---
 
@@ -49,7 +57,8 @@ This pipeline trains the lightweight ESP32 policy directly using Reinforcement L
 ### 3.1 Architectures
 *   **The Critic (Value Function):** `Linear(Priv_Size) -> ReLU -> Linear(128) -> ReLU -> Linear(64) -> ReLU -> Output(1)`
     *   Evaluates the "goodness" of a state. It receives the privileged state $S_t$ to accurately map the value of the robot's current physical situation (e.g., knowing exactly how strong an external push is).
-*   **The Actor (ESP32 Policy):** `Linear(11 * H) -> ReLU -> Linear(64) -> ReLU -> Linear(32) -> ReLU -> Output(2)`
+*   **The Actor (ESP32 Policy):** `Linear(11 * H) -> ReLU -> Linear(128) -> ReLU -> Linear(64) -> ReLU -> Linear(32) -> ReLU -> Output(2)`
+    *   Models up to v7 used `Linear(64) -> Linear(32)` (7.8k weights); the current actor has 21.8k (87 KB as float32, ~22k multiply-adds per step).
     *   Takes the proprioceptive history $O_t$ and outputs actions. It is completely blind to the exact privileged data but receives policy gradients guided by the Critic's accurate value estimations.
 
 ### 3.2 Training Pipeline
@@ -71,6 +80,6 @@ Regardless of which training pipeline is chosen, the resulting ESP32 policy is i
 *   **Inference Constraints:** Utilize only standard matrix multiplications and ReLUs (no transcendental functions like `tanh` or `sigmoid`). This ensures execution times well under `<1ms` on a single-core MCU.
 *   **Execution Loop:** 
     1. Read IMU and Encoder states.
-    2. Shift the new 11-state array into the observation buffer (dropping the oldest frame).
+    2. Shift the new 11-state array into the front of the observation buffer (dropping the oldest frame), using the same units and scaling as in training.
     3. Run the MLP forward pass manually using Eigen.
     4. Output scaled PWM to the motor drivers.
