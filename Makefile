@@ -1,7 +1,7 @@
 PYTHON ?= python3
 VENV ?= .venv
 
-.PHONY: install train evaluate test lint clean
+.PHONY: install train evaluate teleop test lint clean
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -13,6 +13,9 @@ train:
 
 evaluate:
 	$(VENV)/bin/python -m self_balancing_robot.evaluate $(EVALUATE_ARGS)
+
+teleop:
+	$(VENV)/bin/python -m self_balancing_robot.teleop $(TELEOP_ARGS)
 
 test:
 	$(VENV)/bin/python -m pytest
