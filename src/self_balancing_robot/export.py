@@ -1,11 +1,29 @@
-"""Export the trained actor's weights to a C header for the ESP32 (ARCHITECTURE.md, section 4).
+"""Export the trained actor's weights for the ESP32 (ARCHITECTURE.md, section 4).
 
-The header holds every actor layer as ``W[out][in]`` / ``b[out]`` (y = W x + b, ReLU on all
-layers but the last) and the constants needed to build the observation exactly as in
-training (scaling, history length, control period, limits).
+Two files with the same content:
+- a C header with every actor layer as ``W[out][in]`` / ``b[out]`` (y = W x + b, ReLU on all
+  layers but the last) and the constants needed to build the observation exactly as in
+  training (scaling, history length, control period, limits);
+- a binary policy file, which the robot firmware embeds as its built-in policy (and which can
+  be uploaded through its web page). It also holds test vectors, SB3's own actions for a few
+  simulated observations, that the firmware checks its forward pass against at boot.
+
+Policy file, version 1, little-endian (read by ESP32_software/robot/main/policy_net.c):
+    header (`_HEADER`, 96 bytes):
+        magic b"GPOL", version, header size, total size (CRC included),
+        layers, input size, output size, frame size, history length, test vectors,
+        CRC-32 of the frame field names joined by ",",
+        control period (s), max linear / angular command, half track (m),
+        wheel no-load speed (rad/s), tilt limit (rad), model name (44 bytes, NUL-terminated)
+    per layer: in, out, activation (0 none, 2 relu), reserved      4 x uint16
+    per layer: W[out][in] row-major, then b[out]                     float32
+    test inputs [tests][input size], test outputs [tests][output size]  float32
+    CRC-32 (zlib) of everything before it                             uint32
 """
 
 import argparse
+import struct
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +38,16 @@ from self_balancing_robot.envs.balance_env import (
 from self_balancing_robot.policy import load_model
 
 DEFAULT_OUTPUT = Path("models/policy_weights.h")
+DEFAULT_POLICY_FILE = Path("models/policy.bin")
+
+POLICY_FILE_MAGIC = b"GPOL"
+POLICY_FILE_VERSION = 1
+_HEADER = struct.Struct("<4sHHIHHHHHHIffffff44s")
+_LAYER = struct.Struct("<HHHH")
+ACTIVATION_NONE = 0
+ACTIVATION_RELU = 2
+# Simulated observations (and SB3's actions) stored in the policy file for the boot self-test
+NUM_TEST_VECTORS = 8
 
 
 def actor_layers(model) -> list[torch.nn.Linear]:
@@ -99,8 +127,112 @@ def weights_header(model_path: Path, layers: list[torch.nn.Linear], env) -> str:
     return "\n".join(lines)
 
 
-def _check_forward(model, layers: list[torch.nn.Linear], env, seed: int) -> None:
-    """The manual forward pass must reproduce SB3's action on simulated inputs."""
+def frame_fields_crc() -> int:
+    """Identifies the observation layout; the firmware hashes its own field list the same way."""
+    return zlib.crc32(",".join(ACTOR_FRAME_FIELDS).encode())
+
+
+def policy_file(
+    model_path: Path,
+    layers: list[torch.nn.Linear],
+    env,
+    test_inputs: np.ndarray,
+    test_outputs: np.ndarray,
+) -> bytes:
+    command_limits = env.curriculum_config.command_limits
+    name = model_path.as_posix().encode()[-43:]
+    body = b"".join(
+        _LAYER.pack(
+            layer.in_features,
+            layer.out_features,
+            ACTIVATION_RELU if i < len(layers) - 1 else ACTIVATION_NONE,
+            0,
+        )
+        for i, layer in enumerate(layers)
+    )
+    for layer in layers:
+        body += layer.weight.detach().numpy().astype("<f4").tobytes()
+        body += layer.bias.detach().numpy().astype("<f4").tobytes()
+    body += np.asarray(test_inputs, dtype="<f4").tobytes()
+    body += np.asarray(test_outputs, dtype="<f4").tobytes()
+    header = _HEADER.pack(
+        POLICY_FILE_MAGIC,
+        POLICY_FILE_VERSION,
+        _HEADER.size,
+        _HEADER.size + len(body) + 4,
+        len(layers),
+        layers[0].in_features,
+        layers[-1].out_features,
+        ACTOR_FRAME_SIZE,
+        env.history_length,
+        len(test_inputs),
+        frame_fields_crc(),
+        env.dt,
+        command_limits[0],
+        command_limits[1],
+        env._half_track,
+        env._max_wheel_speed,
+        env.environment_config.upright_limit_radians,
+        name,
+    )
+    data = header + body
+    return data + struct.pack("<I", zlib.crc32(data))
+
+
+def read_policy_file(data: bytes) -> dict:
+    """Parse and check a policy file; the inverse of `policy_file`."""
+    fields = _HEADER.unpack_from(data)
+    (magic, version, header_size, total_size, num_layers, input_size, output_size) = fields[:7]
+    if magic != POLICY_FILE_MAGIC or version != POLICY_FILE_VERSION or header_size != _HEADER.size:
+        raise ValueError("not a version 1 policy file")
+    if total_size != len(data):
+        raise ValueError(f"file is {len(data)} bytes, header says {total_size}")
+    (crc,) = struct.unpack_from("<I", data, total_size - 4)
+    if zlib.crc32(data[: total_size - 4]) != crc:
+        raise ValueError("CRC mismatch")
+    names = (
+        "frame_size",
+        "history_length",
+        "num_tests",
+        "frame_fields_crc",
+        "control_period_s",
+        "max_linear_command",
+        "max_angular_command",
+        "half_track_m",
+        "wheel_no_load_speed",
+        "tilt_limit_rad",
+    )
+    policy = dict(zip(names, fields[7:17]))
+    policy["name"] = fields[17].rstrip(b"\0").decode()
+    offset = _HEADER.size
+    shapes = [_LAYER.unpack_from(data, offset + i * _LAYER.size) for i in range(num_layers)]
+    offset += num_layers * _LAYER.size
+
+    def floats(count: int) -> np.ndarray:
+        nonlocal offset
+        values = np.frombuffer(data, dtype="<f4", count=count, offset=offset)
+        offset += 4 * count
+        return values
+
+    policy["layers"] = [
+        (floats(n_in * n_out).reshape(n_out, n_in), floats(n_out), activation)
+        for n_in, n_out, activation, _ in shapes
+    ]
+    n = policy["num_tests"]
+    policy["test_inputs"] = floats(n * input_size).reshape(n, input_size)
+    policy["test_outputs"] = floats(n * output_size).reshape(n, output_size)
+    if offset + 4 != total_size:
+        raise ValueError("file size doesn't match its contents")
+    return policy
+
+
+def _check_forward(
+    model, layers: list[torch.nn.Linear], env, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """The manual forward pass must reproduce SB3's action on simulated inputs.
+
+    Returns the actor inputs and SB3's (clipped) actions for them.
+    """
     observation, _ = env.reset(seed=seed)
     observations = []
     for _ in range(200):
@@ -113,9 +245,16 @@ def _check_forward(model, layers: list[torch.nn.Linear], env, seed: int) -> None
     expected, _ = model.predict(observations, deterministic=True)
     manual = actor_forward(layers, observations[:, : env.actor_observation_size])
     np.testing.assert_allclose(np.clip(manual, -1.0, 1.0), expected, atol=1e-5)
+    return observations[:, : env.actor_observation_size], expected
 
 
-def export(model_path: Path, output: Path, seed: int = 0) -> None:
+def export(
+    model_path: Path, output: Path, seed: int = 0, policy_output: Path | None = None
+) -> None:
+    """Write the C header to `output` and the policy file to `policy_output` (by default
+    next to it, as policy.bin)."""
+    if policy_output is None:
+        policy_output = output.with_name(DEFAULT_POLICY_FILE.name)
     model = load_model(model_path, device="cpu")
     layers = actor_layers(model)
     env = SelfBalancingRobotEnv(curriculum_stage=3)
@@ -125,25 +264,36 @@ def export(model_path: Path, output: Path, seed: int = 0) -> None:
             f"{model_path} expects {layers[0].in_features} inputs, the environment builds "
             f"{env.actor_observation_size}"
         )
-    _check_forward(model, layers, env, seed)
+    inputs, actions = _check_forward(model, layers, env, seed)
+    tests = np.linspace(0, len(inputs) - 1, NUM_TEST_VECTORS).astype(int)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(weights_header(model_path, layers, env))
+    policy_output.parent.mkdir(parents=True, exist_ok=True)
+    policy_output.write_bytes(policy_file(model_path, layers, env, inputs[tests], actions[tests]))
     env.close()
     sizes = [layers[0].in_features, *(layer.out_features for layer in layers)]
     parameters = sum(layer.weight.numel() + layer.bias.numel() for layer in layers)
     print(
         f"Exported {model_path} ({' -> '.join(map(str, sizes))}, {parameters:,} parameters, "
-        f"{parameters * 4 / 1024:.0f} KB as float32) to {output}"
+        f"{parameters * 4 / 1024:.0f} KB as float32) to {output} and {policy_output}"
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export the actor weights to a C header.")
+    parser = argparse.ArgumentParser(
+        description="Export the actor weights to a C header and a policy file for the ESP32."
+    )
     parser.add_argument("--model", type=Path, default=DEFAULT_TRAINING_CONFIG.evaluation_model_path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--policy-output",
+        type=Path,
+        default=None,
+        help="Policy file for the robot firmware (default: policy.bin next to --output).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    export(args.model, args.output, args.seed)
+    export(args.model, args.output, args.seed, args.policy_output)
 
 
 if __name__ == "__main__":

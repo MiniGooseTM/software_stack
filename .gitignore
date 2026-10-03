@@ -225,6 +225,7 @@ logs/
 models/*
 !models/ppo_balance.zip
 !models/policy_weights.h
+!models/policy.bin
 !models/archive/
 models/archive/*
 !models/archive/v7_command_ramp_30M/

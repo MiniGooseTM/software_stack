@@ -176,6 +176,11 @@ void policy_step(const float x[88], float duty[2]) {
 
 The arrays are `static const`: include the header in one source file only. It is ~400 KB of text but compiles to 85 KB.
 
+The same export also writes the **policy file** `models/policy.bin` (format in the `export.py` docstring). The robot firmware (`ESP32_software/robot`) uses this instead of the header: copy it to `robot/main/policy.bin` and rebuild. Along with the weights and the constants above, the file holds:
+*   A CRC-32 of the frame field names. The firmware refuses a policy whose fields, history length, control period or limits differ from its own observation.
+*   8 simulated observations and SB3's actions for them. The firmware checks its forward pass against these at boot (4.9, step 1).
+*   A CRC-32 of the whole file, which also identifies the policy in the firmware log.
+
 ### 4.8 What the Policy Was Trained to Handle
 *   Mass +-10%, CoM shift up to 8 mm per axis, floor friction +-40%, slopes up to 0.3 rad, pushes up to 1 N for 0.1 s, sensor noise and 0-2 steps of latency (see `RandomizationConfig` in `config.py`).
 *   Known weaknesses (`models/archive/v10_reversals_30M/README.md`): forward speed undershoots by ~20%, a forward CoM shift turns into a speed offset (no integral term), and survival on slopes above 0.2 rad is low.
