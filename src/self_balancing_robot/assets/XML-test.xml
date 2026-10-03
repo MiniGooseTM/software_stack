@@ -61,10 +61,14 @@
            dir="0 0 -1" 
            diffuse="0.8 0.8 0.8"/>
 
-        <geom name="ground"
-          type="plane"
-          size="5 5 0.1"
-          material="grid"/>
+        <!-- Mocap body so the training code can tilt the terrain at runtime: MuJoCo never
+             updates the pose of geoms attached directly to the world body. -->
+        <body name="terrain" mocap="true">
+            <geom name="ground"
+              type="plane"
+              size="5 5 0.1"
+              material="grid"/>
+        </body>
 
         <!-- Shift the robot upwards (wheel radius) -->
         <body name="base_link" pos="0.0 0.0 0.03" euler="0.0 -0.0 0.0">
