@@ -221,7 +221,20 @@ __marimo__/
 
 # Experiment outputs
 logs/
-models/
+# Models: only the current policy and the archived v7 (30M) and v10 weights are tracked.
+models/*
+!models/ppo_balance.zip
+!models/archive/
+models/archive/*
+!models/archive/v7_command_ramp_30M/
+!models/archive/v10_reversals_30M/
+models/archive/v7_command_ramp_30M/*
+models/archive/v10_reversals_30M/*
+!models/archive/v7_command_ramp_30M/ppo_balance.zip
+!models/archive/v10_reversals_30M/ppo_balance.zip
+!models/archive/*/README.md
+!models/archive/*/config_snapshot.py
+!models/archive/*/REWARDS_snapshot.md
 # macOS
 .DS_Store
 
