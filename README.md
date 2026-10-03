@@ -57,6 +57,9 @@ values. Use `--model` to drive an archived policy, e.g.
 `src/self_balancing_robot/config.py`; MuJoCo model and geometry values are defined in the XML.
 Pass extra options to `make train` or `make evaluate` with `TRAIN_ARGS` or `EVALUATE_ARGS`.
 
+To deploy on the ESP32, `make export` writes the actor weights and the observation constants of
+`models/ppo_balance.zip` to `models/policy_weights.h` (ARCHITECTURE.md, section 4).
+
 ## Docker
 There's no need for docker in the University Cluster. However it is available in case the cluster isn't.
 The default image is CPU-only and works on macOS Docker Desktop and Ubuntu:
@@ -78,6 +81,7 @@ On an Ubuntu host with an NVIDIA runtime, use `Dockerfile.gpu` and add `--gpus a
 - `src/self_balancing_robot/train.py`: vectorized PPO training entry point.
 - `src/self_balancing_robot/evaluate.py`: visual evaluation entry point.
 - `src/self_balancing_robot/teleop.py`: keyboard driving of a trained policy in a live window.
+- `src/self_balancing_robot/export.py`: actor weights to a C header for the ESP32.
 - `tests/`: environment smoke tests.
 
 The XML is intentionally a starting point. The environment implements four curriculum stages: upright stabilization, micro-mobility, full command tracking, and domain randomization/disturbance recovery. Before transferring a policy to hardware, replace dimensions, masses, friction, actuator limits, sensor observations, latency, and safety thresholds with measured robot values. Collect synchronized IMU, encoder, command, motor, battery, and fall-event logs to calibrate the model and define validation targets.

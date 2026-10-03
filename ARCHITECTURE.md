@@ -74,12 +74,116 @@ This pipeline trains the lightweight ESP32 policy directly using Reinforcement L
 
 ## 4. Hardware Deployment (ESP32)
 
-Regardless of which training pipeline is chosen, the resulting ESP32 policy is identical in structure: a highly efficient feedforward MLP.
+Only the actor runs on the robot; the critic is discarded. The current policy is `models/ppo_balance.zip` (v10). Everything below must match training exactly: a sign, unit or order mismatch in a single input is enough to make the robot fall.
 
-*   **Export:** Export the trained Actor/Student weights as a flat `.h` C++ array.
-*   **Inference Constraints:** Utilize only standard matrix multiplications and ReLUs (no transcendental functions like `tanh` or `sigmoid`). This ensures execution times well under `<1ms` on a single-core MCU.
-*   **Execution Loop:** 
-    1. Read IMU and Encoder states.
-    2. Shift the new 11-state array into the front of the observation buffer (dropping the oldest frame), using the same units and scaling as in training.
-    3. Run the MLP forward pass manually using Eigen.
-    4. Output scaled PWM to the motor drivers.
+### 4.1 Network and Cost
+*   **Layers:** `x[88] -> Linear(128) -> ReLU -> Linear(64) -> ReLU -> Linear(32) -> ReLU -> Linear(2)`. The last layer has **no activation**.
+*   **Size:** 21,794 parameters, 87 KB as `float32`. Keep them `const` so they stay in flash.
+*   **Cost:** ~22k multiply-adds per step, roughly 0.3-0.5 ms on a 240 MHz ESP32 with its FPU. Measure it on the board.
+*   **No input normalization:** the network takes the scaled frame of 4.4 directly (training used no `VecNormalize`).
+
+### 4.2 Control Loop Timing
+*   **Rate:** 100 Hz (10 ms per step: sim timestep 5 ms x `frame_skip` 2). Run the loop on a hardware timer, not `delay()`.
+*   **Latency tolerated:** training delayed the motor command, the IMU and the encoders by 0-2 steps each (up to 20 ms). Keep the time from reading the sensors to writing the PWM well below one step.
+*   **Each step:**
+    1. Read the IMU and the encoders.
+    2. Build the new 11-value frame (4.4) and shift it into the front of the history.
+    3. Run the forward pass (4.5).
+    4. Clip the two outputs to [-1, 1], write them as PWM (4.6) and keep them as the previous action for the next frame.
+
+### 4.3 Axes and Signs
+The sim's body frame is **x = towards the right wheel (along the axle), y = forward, z = up**. The real IMU axes must be remapped to this frame:
+
+| Quantity | Positive when | Source |
+|---|---|---|
+| `pitch` | the top leans **backward** (driving off forward makes it positive) | attitude estimate, rad |
+| `roll` | the top leans towards the **right** wheel | attitude estimate, rad |
+| `pitch_rate` | pitch increasing (rotation about +x, the axle towards the right wheel) | gyro, rad/s |
+| `roll_rate` | roll increasing (rotation about +y, forward) | gyro, rad/s |
+| `yaw_rate` | turning **left** (counter-clockwise seen from above) | gyro z, body frame, rad/s |
+| wheel velocity | that wheel **rolls the robot forward** (both wheels, despite the mirrored motors) | encoder, rad/s |
+| duty / action | that wheel is driven **forward** | output |
+| `v_cmd` / `omega_cmd` | drive forward / turn left | joystick |
+
+Check every row on the real robot before the first balancing test (4.8).
+
+### 4.4 Building the Observation
+One frame, in this order (`ACTOR_FRAME_FIELDS` in `envs/balance_env.py`):
+
+| # | Field | Scaling |
+|---|---|---|
+| 0 | `v_cmd` | divided by 0.3 m/s |
+| 1 | `omega_cmd` | divided by 1.5 rad/s |
+| 2 | `roll` | rad |
+| 3 | `pitch` | rad |
+| 4 | `roll_rate` | rad/s |
+| 5 | `pitch_rate` | rad/s |
+| 6 | `yaw_rate` | rad/s |
+| 7 | left wheel velocity | divided by 19.4 rad/s (motor no-load speed) |
+| 8 | right wheel velocity | divided by 19.4 rad/s |
+| 9 | previous left action | clipped duty from the last step |
+| 10 | previous right action | clipped duty from the last step |
+
+*   **Angles:** roll and pitch are the tilt of gravity in the body frame, from a fused attitude estimate (e.g. complementary or Mahony filter on accelerometer and gyro). Training added 0.01 rad of noise; a raw accelerometer angle is far noisier while the robot accelerates.
+*   **Rates:** raw gyro in the body frame (training noise 0.05 rad/s). Remove the gyro bias at startup.
+*   **Wheel velocities:** from the encoders, in rad/s of the wheel (training noise 0.3 rad/s). Use the encoder count difference over the 10 ms step, or a short moving average.
+*   **History:** the input is the last 8 frames, **newest first**: `x[0..10]` = current frame, `x[11..21]` = previous frame, ..., `x[77..87]` = 7 steps ago. Shift with `memmove` or a ring buffer that is read newest first.
+*   **Startup:** set the previous action to 0 and fill all 8 slots with copies of the first frame.
+
+### 4.5 Joystick Commands
+Apply the same limits as training before scaling:
+1. Clamp `v_cmd` to +-0.3 m/s and `omega_cmd` to +-1.5 rad/s.
+2. Keep the outer wheel within 0.3 m/s: if `|v| + |omega| * 0.0645 > 0.3` (half track 6.45 cm), multiply **both** by `0.3 / (|v| + |omega| * 0.0645)`.
+3. Divide by 0.3 and 1.5 for the frame.
+
+Instant full reversals (+0.3 -> -0.3 m/s) are part of training (v10), so no ramp is required. A slew-rate limit (e.g. 0.6 m/s^2) is still a cheap extra safety margin.
+
+### 4.6 Forward Pass and Motor Output
+Weights are exported row-major as `W[out][in]`, so each layer is `y = W x + b`:
+
+```c
+#include "policy_weights.h"   // generated by `make export` (4.7)
+
+static void dense(const float *W, const float *b, const float *x, float *y,
+                  int n_out, int n_in, bool relu) {
+    for (int o = 0; o < n_out; o++) {
+        float acc = b[o];
+        const float *row = W + o * n_in;
+        for (int i = 0; i < n_in; i++) acc += row[i] * x[i];
+        y[o] = (relu && acc < 0.0f) ? 0.0f : acc;
+    }
+}
+
+void policy_step(const float x[88], float duty[2]) {
+    float h0[128], h1[64], h2[32], out[2];
+    dense(&POLICY_W0[0][0], POLICY_B0, x,  h0, 128, 88,  true);
+    dense(&POLICY_W1[0][0], POLICY_B1, h0, h1, 64,  128, true);
+    dense(&POLICY_W2[0][0], POLICY_B2, h1, h2, 32,  64,  true);
+    dense(&POLICY_W3[0][0], POLICY_B3, h2, out, 2,  32,  false);  // no activation
+    for (int i = 0; i < 2; i++)
+        duty[i] = fminf(fmaxf(out[i], -1.0f), 1.0f);      // 0 = left, 1 = right
+}
+```
+
+*   **The output is a duty, not a speed setpoint:** in simulation, duty `d` drives the DC-motor model `torque = kv * (d * 19.4 rad/s - wheel_speed)`, which is what a PWM duty of `d` on the H-bridge does to a real motor (the voltage is `d * V_supply`). Write `|duty|` as the PWM compare value and `sign(duty)` to the direction pins. Do **not** put a wheel-speed PID in between.
+*   **Feedback:** the clipped duty is also the "previous action" in the next frame.
+*   **Supply voltage:** training assumed the no-load speed of 19.4 rad/s, i.e. the nominal battery voltage. If the battery sags, scale the duty by `V_nominal / V_battery` (clipped to [-1, 1]) so the motor sees the voltage the policy expects.
+
+### 4.7 Exporting the Weights
+`make export` (or `PYTHONPATH=src .venv/bin/python -m self_balancing_robot.export --model <zip> --output <file.h>`) writes `models/policy_weights.h` from `models/ppo_balance.zip`. Before writing, it checks that its plain forward pass reproduces the trained policy's actions on simulated inputs. The header contains:
+*   `POLICY_W0..W3[out][in]` and `POLICY_B0..B3[out]`, plus `POLICY_WEIGHTS`, `POLICY_BIASES`, `POLICY_LAYER_IN` and `POLICY_LAYER_OUT` tables, so a loop over `POLICY_NUM_LAYERS` also works if the network size changes.
+*   The constants from 4.2-4.5 (`POLICY_FRAME_SIZE`, `POLICY_HISTORY_LENGTH`, `POLICY_CONTROL_PERIOD_S`, `POLICY_MAX_LINEAR_COMMAND`, `POLICY_MAX_ANGULAR_COMMAND`, `POLICY_HALF_TRACK_M`, `POLICY_WHEEL_NO_LOAD_SPEED`, `POLICY_TILT_LIMIT_RAD`) and the frame field order.
+
+The arrays are `static const`: include the header in one source file only. It is ~400 KB of text but compiles to 85 KB.
+
+### 4.8 What the Policy Was Trained to Handle
+*   Mass +-10%, CoM shift up to 8 mm per axis, floor friction +-40%, slopes up to 0.3 rad, pushes up to 1 N for 0.1 s, sensor noise and 0-2 steps of latency (see `RandomizationConfig` in `config.py`).
+*   Known weaknesses (`models/archive/v10_reversals_30M/README.md`): forward speed undershoots by ~20%, a forward CoM shift turns into a speed offset (no integral term), and survival on slopes above 0.2 rad is low.
+*   Training ends an episode when roll or pitch passes 0.6 rad or the chassis touches the ground: past that the policy has never been trained, so cut the motors there.
+
+### 4.9 Bring-Up Checklist
+1. **Forward pass:** log a few real 88-value inputs, run them through the Python model (`model.predict(obs, deterministic=True)` with the 88 values at the front of a zero observation) and compare with the ESP32 outputs (should agree to ~1e-5).
+2. **Signs:** with the robot held, tilt it, turn it and spin each wheel by hand, and check every row of 4.3 in the logged frame.
+3. **Motors:** a small positive duty on each wheel must roll the robot forward.
+4. **Timing:** measure the loop period (10 ms) and the sensor-to-PWM time.
+5. **First run:** on a tether or with a hand close, zero command, motors cut past 0.6 rad.
