@@ -1,0 +1,105 @@
+<mujoco model="MiniGoose">
+    <compiler angle="radian" eulerseq="XYZ" inertiafromgeom="false" />
+    <option timestep="0.002" integrator="implicitfast" />
+
+    <default>
+        <default class="visual">
+            <!-- No collision, no mass, shown in viewer group 2-->
+            <geom type="mesh" contype="0" conaffinity="0" group="2" density="0"/>
+        </default>
+        <default class="collision">
+            <!-- group 3 is hidden by default -->
+            <geom contype="1" conaffinity="1" group="3"/>
+        </default>
+        <geom contype="1" conaffinity="1" friction="0.8 0.005 0.0001"/>
+    </default>
+
+    <!-- Scale all meshes to meters -->
+    <asset>
+        <mesh name="base_link_mesh" file="meshes/base_link.stl" scale="0.001 0.001 0.001" />
+        <mesh name="right_wheel_mesh" file="meshes/right_wheel.stl" scale="0.001 0.001 0.001" />
+        <mesh name="left_wheel_mesh" file="meshes/left_wheel.stl" scale="0.001 0.001 0.001" />
+
+        <material name="duck_gray_color" rgba="0.7 0.7 0.7 1"/>
+        <material name="duck_orange_color" rgba="1 0.5 0 1"/>
+    </asset>
+
+    <worldbody>
+        <!-- Body axes: x = wheel axle, y = forward, z = up.
+             Shift the robot upwards by the wheel radius (axle is at z=0 in the body frame). -->
+        <body name="base_link" pos="0.0 0.0 0.0275" euler="0.0 -0.0 0.0">
+            <!-- So that the robot can move freely -->
+            <joint name="base_link_joint" type="free"/>
+
+            <geom name="base_link_geom" class="visual" material="duck_gray_color" mesh="base_link_mesh" pos="0 0 0" euler="0 0 0"/>
+            <!-- Collision box fitted to the base_link mesh bounds (body frame):
+                 x [-0.0775, 0.0375], y [-0.0425, 0.0425], z [-0.005, 0.125] -->
+            <geom name="base_link_collision" class="collision" type="box" pos="-0.02 0 0.06" size="0.0575 0.0425 0.065"/>
+            <inertial mass="0.24835069187932704"
+                pos="-0.019346403927430512 -6.609349944465365e-05 0.045477187543602846"
+                fullinertia="0.0003872644555911833 0.0004232747733534726 0.00027826819613524284 1.876027307719341e-06 -1.6132214508309797e-06 -1.2042763180378539e-05" />
+            <!-- IMU: 5 mm above the chassis bottom face (z=0.005), 5 mm in from the left chassis wall (x=-0.0585),
+                 approximately above the wheel axle (y=0) -->
+            <site name="imu_site"
+                type="box"
+                pos="-0.0535 0 0.010"
+                size="0.005 0.005 0.002"
+                rgba="1 0 0 1"/>
+
+            <body name="right_wheel"
+                pos="0.040999999999999995 0.0 0.0"
+                euler="-0.0 -1.5707963267948966 0">
+                <!-- Axis is world -x for both wheels (as in robot.xml), so positive ctrl drives the robot towards +y.
+                     armature: rotor inertia * 150^2 (estimate); frictionloss: gearbox static friction (estimate) -->
+                <joint name="right_wheel_joint"
+                    type="hinge"
+                    armature="5.6e-5"
+                    frictionloss="0.01"
+                    axis="0.0 0.0 1.0"
+                    pos="1e-06 0.00015 0.006599999999999995" />
+                <geom name="right_wheel_geom" class="visual" mesh="right_wheel_mesh" material="duck_orange_color" pos="0 0 0" euler="0 0 0"/>
+                <!-- Wheels collide as simple cylinders (r=2.75cm, w=1.5cm), mesh spans local z [0, 0.015] -->
+                <geom name="right_wheel_collision" class="collision" type="cylinder" fromto="0 0 0 0 0 0.015" size="0.0275"/>
+                <inertial mass="0.011025667598199503"
+                    pos="1.7179833156161337e-05 5.064798715460153e-08 0.007500000245801904"
+                    fullinertia="3.0308859584549704e-06 3.0303183366326515e-06 5.661560123855392e-06 3.1515533426011123e-12 -2.7591154857320217e-15 -7.26156404163909e-15" />
+            </body>
+            <body name="left_wheel"
+                pos="-0.08100000000000002 0.0 0.0"
+                euler="0 1.5707963267948966 0">
+                <joint name="left_wheel_joint"
+                    type="hinge"
+                    armature="5.6e-5"
+                    frictionloss="0.01"
+                    axis="0.0 0.0 -1.0"
+                    pos="-9.99999999999975e-07 -0.00014999999999996597 0.0066000000000000225" />
+                <geom name="left_wheel_geom" class="visual" mesh="left_wheel_mesh" material="duck_orange_color" pos="0 0 0" euler="0 0 0"/>
+                <geom name="left_wheel_collision" class="collision" type="cylinder" fromto="0 0 0 0 0 0.015" size="0.0275"/>
+                <inertial mass="0.011025667598199503" pos="1.7179833156161337e-05 5.064798715460152e-08 0.007500000245801894" fullinertia="3.0308859584549653e-06 3.030318336632638e-06 5.661560123855392e-06 3.151553342601112e-12 -2.759115482422773e-15 -7.261564041639636e-15" />
+            </body>
+        </body>
+    </worldbody>
+
+    <!-- N20 12V 150:1 (1.2 kg*cm stall, 200 rpm no-load @ 12V) on a 3S LiPo (11.1V nominal).
+         DC motor model: torque = kv * (ctrl - wheel_vel), kv = stall torque / no-load speed
+         = 0.1177 Nm / 20.94 rad/s = 0.00562 (independent of supply voltage).
+         Stall torque and no-load speed scale with voltage: at 11.1V -> 0.109 Nm, 19.4 rad/s.
+         ctrl = PWM duty * 19.4 rad/s. forcerange = stall torque at 11.1V. -->
+    <actuator>
+        <velocity name="motor_l_wheel" joint="left_wheel_joint" ctrllimited="true" ctrlrange="-19.4 19.4" kv="0.00562" forcelimited="true" forcerange="-0.109 0.109"/>
+        <velocity name="motor_r_wheel" joint="right_wheel_joint" ctrllimited="true" ctrlrange="-19.4 19.4" kv="0.00562" forcelimited="true" forcerange="-0.109 0.109"/>
+    </actuator>
+
+    <sensor>
+        <!-- IMU -->
+        <accelerometer name="imu_accel" site="imu_site"/>
+        <gyro name="imu_gyro" site="imu_site"/>
+        <framequat name="imu_orientation" objtype="site" objname="imu_site"/>
+        <!-- Note that we don't have access to the orientation on the real robot, just the rate -->
+        <!-- Wheel encoders (joint position and velocity) -->
+        <jointpos name="left_wheel_pos" joint="left_wheel_joint"/>
+        <jointpos name="right_wheel_pos" joint="right_wheel_joint"/>
+        <jointvel name="left_wheel_vel" joint="left_wheel_joint"/>
+        <jointvel name="right_wheel_vel" joint="right_wheel_joint"/>
+    </sensor>
+</mujoco>
