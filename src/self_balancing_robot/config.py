@@ -14,7 +14,7 @@ class RewardConfig:
     linear_velocity_weight: float = 2.0
     angular_velocity_weight: float = 1.0
     action_weight: float = 0.01
-    smoothness_weight: float = 0.05
+    smoothness_weight: float = 0.5
     # Speed tracking blends a narrow kernel (precision near the command) with a wide one
     # (a gradient even far from it). With only the narrow kernel, v2 learned to crawl at
     # 0.05 m/s for 0.5 m/s commands because speeding up earned no reward until close.
