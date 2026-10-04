@@ -12,11 +12,11 @@ matplotlib.use("Agg")
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
-import mujoco
 import numpy as np
 
 from self_balancing_robot.actor import Actor, forward
 from self_balancing_robot.envs.balance_env import ACTOR_KEY, SelfBalancingRobotEnv
+from self_balancing_robot.render import render_frames
 
 TRACE_KEYS = ("v_cmd", "forward_velocity", "omega_cmd", "yaw_rate", "pitch")
 METRIC_KEYS = ("reward", "survival", "linear_error", "angular_error", "abs_pitch_deg")
@@ -108,34 +108,18 @@ def summarize(trace: dict) -> dict[str, float]:
     }
 
 
-def tracking_camera(env: SelfBalancingRobotEnv) -> mujoco.MjvCamera:
-    """Camera that follows the robot base (behind and above it)."""
-    cfg = env.environment_config
-    camera = mujoco.MjvCamera()
-    camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-    camera.trackbodyid = env.mj_model.body("base_link").id
-    camera.distance = cfg.camera_distance_m
-    camera.elevation = cfg.camera_elevation_degrees
-    camera.azimuth = cfg.camera_azimuth_degrees
-    return camera
-
-
 def render_trace(
     env: SelfBalancingRobotEnv, trace: dict, width: int = 640, height: int = 480
 ) -> list[np.ndarray]:
     """Frames of an episode run with ``record_states=True`` (needs MUJOCO_GL=egl headless)."""
-    model = env.mj_model
-    data = mujoco.MjData(model)
-    camera = tracking_camera(env)
-    frames = []
-    with mujoco.Renderer(model, height=height, width=width) as renderer:
-        for qpos, mocap_quat in zip(trace["qpos"], trace["mocap_quat"]):
-            data.qpos[:] = qpos
-            data.mocap_quat[:] = mocap_quat
-            mujoco.mj_forward(model, data)
-            renderer.update_scene(data, camera=camera)
-            frames.append(renderer.render())
-    return frames
+    return render_frames(
+        env.mj_model,
+        env.environment_config,
+        trace["qpos"],
+        trace["mocap_quat"],
+        width,
+        height,
+    )
 
 
 def plot_episode(trace: dict, output_path: Path, title: str = "") -> None:
@@ -165,7 +149,7 @@ def plot_episode(trace: dict, output_path: Path, title: str = "") -> None:
         axis.legend(loc="upper right", fontsize="small")
     metrics = summarize(trace)
     figure.suptitle(
-        f"{title} stage {trace['stage']} \"{trace['stage_name']}\", ended by {trace['end']} after {time[-1]:.1f} s\n"
+        f'{title} stage {trace["stage"]} "{trace["stage_name"]}", ended by {trace["end"]} after {time[-1]:.1f} s\n'
         f"mean |v error| {metrics['linear_error']:.3f} m/s, "
         f"mean |yaw error| {metrics['angular_error']:.3f} rad/s, "
         f"mean |pitch| {metrics['abs_pitch_deg']:.1f} deg"

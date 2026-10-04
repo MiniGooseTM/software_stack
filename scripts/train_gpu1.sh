@@ -21,8 +21,6 @@ else
 fi
 "$VENV/bin/python" -c "import jax; d = jax.devices()[0]; assert d.platform == 'gpu', d; print('GPU:', d.device_kind)"
 
-# Headless video rendering.
-export MUJOCO_GL=egl
 # The GPU may be shared: allocate memory as needed instead of 75% of it up front.
 export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
 

@@ -18,11 +18,9 @@ import json
 import math
 import re
 import time
-import warnings
 from collections import defaultdict
 from pathlib import Path
 
-import imageio
 import jax
 import numpy as np
 from brax.training.agents.ppo import train as ppo
@@ -45,10 +43,10 @@ from self_balancing_robot.metrics import (
     METRIC_KEYS,
     plot_episode,
     plot_training_metrics,
-    render_trace,
     run_episodes,
     summarize,
 )
+from self_balancing_robot.render import BackgroundRenderer, save_states
 
 
 class TrainingMonitor:
@@ -73,6 +71,7 @@ class TrainingMonitor:
         # Stages passed since the last checkpoint, recorded there (the passing weights are only
         # handed to the host at checkpoints).
         self.passed_stages: list[int] = []
+        self.renderer = BackgroundRenderer()
         self.history: dict[str, list] = defaultdict(list)
         self.started = time.time()
 
@@ -137,7 +136,9 @@ class TrainingMonitor:
             [stage.name for stage in self.env.curriculum],
         )
         plot_episode(
-            current[0], self.run_dir / "plots" / "eval_episode_latest.png", f"After {total:,} steps,"
+            current[0],
+            self.run_dir / "plots" / "eval_episode_latest.png",
+            f"After {total:,} steps,",
         )
         hours = (time.time() - self.started) / 3600
         print(
@@ -165,19 +166,13 @@ class TrainingMonitor:
             record_states=True,
         )[0]
         plot_episode(trace, self.run_dir / "plots" / "stages" / f"{name}.png", title)
-        try:
-            frames = render_trace(self.env, trace)
-        # A video must never stop training; rendering needs a GL context (MUJOCO_GL=egl).
-        except Exception as error:  # noqa: BLE001
-            print(f"Skipping video ({type(error).__name__}: {error})", flush=True)
-            return
-        path = self.run_dir / "videos" / f"{name}.mp4"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with warnings.catch_warnings():
-            # imageio starts ffmpeg with fork+exec, which JAX warns about but is safe.
-            warnings.filterwarnings("ignore", message="os.fork", category=RuntimeWarning)
-            imageio.mimsave(path, frames, fps=round(1 / self.env.dt))
-        print(f"Saved the plot and video of {self.describe(stage)} as {name}", flush=True)
+        # Rendered in a child process: OpenGL failures must never stop training.
+        states = self.run_dir / "videos" / f"{name}.npz"
+        save_states(states, trace, self.env.environment_config.model_file, round(1 / self.env.dt))
+        self.renderer.render(states)
+        print(
+            f"Saved the plot of {self.describe(stage)} as {name}; rendering its video", flush=True
+        )
 
 
 def _slug(name: str) -> str:
@@ -205,7 +200,7 @@ def resumed_stage(resumed: dict) -> int:
         return names.index(name)
     index = min(int(resumed.get("stage", 0)), len(CURRICULUM) - 1)
     print(
-        f'Warning: the resumed run\'s stage {name!r} is not in the curriculum; continuing at '
+        f"Warning: the resumed run's stage {name!r} is not in the curriculum; continuing at "
         f'stage {index} "{CURRICULUM[index].name}" by index.',
         flush=True,
     )
@@ -276,9 +271,7 @@ def main() -> None:
 
     env = SelfBalancingRobotEnv(start_stage=stage)
     writer = SummaryWriter(str(cfg.log_dir / run_dir.name))
-    monitor = TrainingMonitor(
-        run_dir, env, writer, cfg, args.seed, steps_offset=steps_offset
-    )
+    monitor = TrainingMonitor(run_dir, env, writer, cfg, args.seed, steps_offset=steps_offset)
     print(
         f"Training in {run_dir} on {jax.devices()[0].device_kind}: {args.num_envs} environments, "
         f"{args.timesteps:,} steps from {monitor.describe()}"
@@ -328,6 +321,7 @@ def main() -> None:
         suffix="_end",
     )
     writer.close()
+    monitor.renderer.wait()
     print(
         f"Saved {run_dir} ({monitor.describe()}, {total:,} steps). "
         f"Continue with --resume {run_dir}",
