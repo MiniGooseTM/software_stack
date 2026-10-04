@@ -22,12 +22,12 @@ Each run writes to its own directory, `models/runs/<date-time>/` (or `--run-dir`
 - `params.pkl`: the latest weights (actor, critic), saved every `--eval-freq` steps (5M);
 - `curriculum.json`: curriculum stage (index and name) and the total number of steps;
 - `config.json`: all settings of the run, including the curriculum;
-- `plots/training_metrics.png`: reward, survival, velocity and yaw-rate tracking error and mean |pitch| of deterministic episodes at the current curriculum stage and at the last stage, and the curriculum stage over time; `plots/eval_episode_latest.png` / `eval_episode_final.png`: command vs response of one episode;
-- `videos/`: an MP4 of one episode every `--video-freq` steps (25M) and at the end.
+- `plots/training_metrics.png`: reward, survival, velocity and yaw-rate tracking error and mean |pitch| of deterministic episodes at the current curriculum stage and at the last stage, and the curriculum stage over time; `plots/eval_episode_latest.png`: command vs response of one episode at the current stage, updated at every checkpoint;
+- `plots/stages/` and `videos/`: for every stage passed, a plot (as above) and an MP4 of one episode at that stage, named after it (e.g. `stage_02_commands_0.2_m-s.png` / `.mp4`), plus one of the stage training ended at (`..._end`). The weights only reach the host at checkpoints, so these show the policy at the first checkpoint after the stage was passed (at most `--eval-freq` steps later).
 
 The same numbers, the PPO losses and the curriculum go to TensorBoard: `.venv/bin/tensorboard --logdir logs`. Curriculum stage changes are also printed as they happen.
 
-Continue a run with `make train TRAIN_ARGS="--resume models/runs/<run>"`; it picks up the weights and the curriculum stage (matched by name, so stages added earlier in the list do not shift it; `--start-stage <name or index>` overrides it), and `--timesteps` counts the extra steps. Other options: `--num-envs` (a multiple of 16), `--seed`, `--eval-freq`, `--video-freq`.
+Continue a run with `make train TRAIN_ARGS="--resume models/runs/<run>"`; it picks up the weights and the curriculum stage (matched by name, so stages added earlier in the list do not shift it; `--start-stage <name or index>` overrides it), and `--timesteps` counts the extra steps. Other options: `--num-envs` (a multiple of 16), `--seed`, `--eval-freq`.
 
 **The curriculum** is the list of stages in `src/self_balancing_robot/curriculum.py`: each stage sets what the environment samples (command range, slopes, pushes, randomized physics, latency, noise) and the test to leave it. Add or change stages there (REWARDS.md, section 3). Other defaults (reward, environment, network, PPO) are in `src/self_balancing_robot/config.py`; MuJoCo model and geometry values are defined in the XML.
 

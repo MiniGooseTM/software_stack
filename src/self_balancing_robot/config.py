@@ -89,7 +89,6 @@ class TrainingConfig:
     evaluation_episodes: int = 32
     evaluation_max_steps: int = 1_000
     evaluation_seed_offset: int = 1_000_000
-    video_frequency: int = 25_000_000
     log_dir: Path = Path("logs")
 
 

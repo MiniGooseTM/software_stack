@@ -4,6 +4,9 @@ Everything a run produces goes into its run directory (default ``models/runs/<ti
 ``params.pkl`` (latest checkpoint), ``curriculum.json`` (stage index and name, steps; read by
 ``--resume``), ``config.json``, ``plots/`` and ``videos/``. TensorBoard logs go to
 ``logs/<run name>``.
+
+When a curriculum stage is passed, and when training ends, one deterministic episode at that
+stage is saved as a plot (``plots/stages/``) and a video (``videos/``).
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import dataclasses
 import functools
 import json
 import math
+import re
 import time
 import warnings
 from collections import defaultdict
@@ -57,7 +61,6 @@ class TrainingMonitor:
         writer: SummaryWriter,
         cfg: TrainingConfig,
         seed: int,
-        video_frequency: int,
         steps_offset: int = 0,
     ):
         self.run_dir = run_dir
@@ -65,11 +68,12 @@ class TrainingMonitor:
         self.writer = writer
         self.cfg = cfg
         self.seeds = [seed + cfg.evaluation_seed_offset + i for i in range(cfg.evaluation_episodes)]
-        self.video_frequency = video_frequency
         self.steps_offset = steps_offset
         self.stage = env.start_stage
+        # Stages passed since the last checkpoint, recorded there (the passing weights are only
+        # handed to the host at checkpoints).
+        self.passed_stages: list[int] = []
         self.history: dict[str, list] = defaultdict(list)
-        self.next_video = steps_offset + video_frequency
         self.started = time.time()
 
     def describe(self, stage: int | None = None) -> str:
@@ -88,6 +92,7 @@ class TrainingMonitor:
         """Called from the GPU each time a curriculum window of episodes is evaluated."""
         stage, new_stage = int(stats["stage"]), int(stats["new_stage"])
         if new_stage != stage:
+            self.passed_stages.append(stage)
             print(
                 f"Curriculum: {self.describe(stage)} -> {self.describe(new_stage)} (survival "
                 f"{stats['success_rate']:.0%}, speed ratio {stats['speed_ratio']:.2f}, "
@@ -109,7 +114,7 @@ class TrainingMonitor:
             )
 
     def checkpoint(self, step: int, make_policy, params) -> None:
-        """Brax `policy_params_fn`: save, evaluate, plot and (sometimes) record a video."""
+        """Brax `policy_params_fn`: save, evaluate, plot; record the stages just passed."""
         jax.effects_barrier()  # curriculum callbacks of the last training epoch
         total = self.steps_offset + step
         save_params(self.run_dir, params, self.curriculum_state(total))
@@ -143,34 +148,41 @@ class TrainingMonitor:
             f"{self.history['stage_linear_error'][-1]:.3f} m/s  [{hours:.2f} h]",
             flush=True,
         )
-        if total >= self.next_video:
-            self.record_video(actor, f"step_{total:011d}")
-            while self.next_video <= total:
-                self.next_video += self.video_frequency
+        for stage in self.passed_stages:
+            self.record_stage(actor, stage, f"Passed after {total:,} steps,")
+        self.passed_stages.clear()
         self.writer.flush()
 
-    def record_video(self, actor: Actor, name: str) -> None:
+    def record_stage(self, actor: Actor, stage: int, title: str, suffix: str = "") -> None:
+        """Save a plot and a video of one deterministic episode at `stage`."""
+        name = f"stage_{stage:02d}_{_slug(self.env.curriculum[stage].name)}{suffix}"
+        trace = run_episodes(
+            self.env,
+            actor,
+            self.seeds[:1],
+            self.cfg.evaluation_max_steps,
+            stage,
+            record_states=True,
+        )[0]
+        plot_episode(trace, self.run_dir / "plots" / "stages" / f"{name}.png", title)
         try:
-            trace = run_episodes(
-                self.env,
-                actor,
-                self.seeds[:1],
-                self.cfg.evaluation_max_steps,
-                self.stage,
-                record_states=True,
-            )[0]
             frames = render_trace(self.env, trace)
         # A video must never stop training; rendering needs a GL context (MUJOCO_GL=egl).
         except Exception as error:  # noqa: BLE001
             print(f"Skipping video ({type(error).__name__}: {error})", flush=True)
             return
-        path = self.run_dir / "videos" / f"{name}_stage{self.stage}.mp4"
+        path = self.run_dir / "videos" / f"{name}.mp4"
         path.parent.mkdir(parents=True, exist_ok=True)
         with warnings.catch_warnings():
             # imageio starts ffmpeg with fork+exec, which JAX warns about but is safe.
             warnings.filterwarnings("ignore", message="os.fork", category=RuntimeWarning)
             imageio.mimsave(path, frames, fps=round(1 / self.env.dt))
-        print(f"Saved evaluation video to {path}", flush=True)
+        print(f"Saved the plot and video of {self.describe(stage)} as {name}", flush=True)
+
+
+def _slug(name: str) -> str:
+    """File-name friendly stage name: "commands 0.1 m/s" -> "commands_0.1_m-s"."""
+    return re.sub(r"[^\w.-]+", "_", name.replace("/", "-")).strip("_")
 
 
 def _jsonable(value):
@@ -215,7 +227,6 @@ def main() -> None:
         "--run-dir", type=Path, default=None, help="Output directory (default models/runs/<time>)."
     )
     parser.add_argument("--eval-freq", type=int, default=cfg.evaluation_frequency)
-    parser.add_argument("--video-freq", type=int, default=cfg.video_frequency)
     parser.add_argument(
         "--resume",
         type=Path,
@@ -266,7 +277,7 @@ def main() -> None:
     env = SelfBalancingRobotEnv(start_stage=stage)
     writer = SummaryWriter(str(cfg.log_dir / run_dir.name))
     monitor = TrainingMonitor(
-        run_dir, env, writer, cfg, args.seed, args.video_freq, steps_offset=steps_offset
+        run_dir, env, writer, cfg, args.seed, steps_offset=steps_offset
     )
     print(
         f"Training in {run_dir} on {jax.devices()[0].device_kind}: {args.num_envs} environments, "
@@ -309,10 +320,13 @@ def main() -> None:
     total = steps_offset + args.timesteps
     jax.effects_barrier()
     save_params(run_dir, params, monitor.curriculum_state(total))
-    actor = Actor(layers_from_brax(params[1]))
-    trace = run_episodes(env, actor, monitor.seeds[:1], cfg.evaluation_max_steps, monitor.stage)[0]
-    plot_episode(trace, run_dir / "plots" / "eval_episode_final.png", "Final policy,")
-    monitor.record_video(actor, "final")
+    # The stage training ended at (not passed, unless it is the last one).
+    monitor.record_stage(
+        Actor(layers_from_brax(params[1])),
+        monitor.stage,
+        f"End of training ({total:,} steps),",
+        suffix="_end",
+    )
     writer.close()
     print(
         f"Saved {run_dir} ({monitor.describe()}, {total:,} steps). "
