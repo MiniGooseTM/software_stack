@@ -70,20 +70,26 @@ This pipeline trains the lightweight ESP32 policy directly using Reinforcement L
     *   Because the Actor drives the rollout itself, it naturally experiences edge cases and learns its own optimal recovery maneuvers.
 4.  **Extraction:** Discard the Critic. Extract the Actor for deployment.
 
+### 3.3 Training Stack (GPU)
+*   **Simulation:** MuJoCo MJX (JAX) runs thousands of copies of the robot in parallel on one GPU (`envs/balance_env.py`). The robot model is `assets/goose.xml`, placed on a tiltable ground plane by `assets/env_v0.xml`; the MJX copy drops the visual meshes and caps the constraint solver at 4 iterations (trajectories match MuJoCo's default of 100 to ~1e-6; 2.6x faster in a batch). The same environment runs on the CPU for evaluation, teleop, export and tests.
+*   **PPO:** Brax PPO (`train.py`), 4,096 environments, 32-step rollouts, 16 minibatches, 4 epochs, learning rate 3e-4, $\gamma = 0.99$, $\lambda = 0.95$, clip 0.2, entropy 0.01. On an RTX 4050 laptop GPU it runs ~165k environment steps per second in training (the earlier SB3 setup ran on 8 CPU cores).
+*   **Networks:** as in 3.1, ReLU. The action distribution is a plain Gaussian (no tanh) with a learned state-independent std (initially 0.61), so the deterministic action is the linear output that the firmware clips. Weights start as in SB3 (orthogonal, action layer gain 0.01), so training starts near zero action. Some runs still learned to balance while spinning in place at ~8 rad/s, so spinning faster than 3 rad/s now ends the episode (REWARDS.md section 4).
+*   **Episodes:** a finished environment starts a fresh episode at once (new slope, physics, heading and command at the current curriculum level), and timeouts are bootstrapped (Brax's `truncation`). The curriculum is global (`envs/wrappers.py`, REWARDS.md section 3).
+
 ---
 
 ## 4. Hardware Deployment (ESP32)
 
-Only the actor runs on the robot; the critic is discarded. The current policy is `models/ppo_balance.zip` (v10). Everything below must match training exactly: a sign, unit or order mismatch in a single input is enough to make the robot fall.
+Only the actor runs on the robot; the critic is discarded. The deployed policy is `models/policy.bin` (v10, trained with SB3 on the earlier model `XML-test.xml`); new policies come from GPU training runs in `models/runs/` (3.3). Everything below must match training exactly: a sign, unit or order mismatch in a single input is enough to make the robot fall.
 
 ### 4.1 Network and Cost
 *   **Layers:** `x[88] -> Linear(128) -> ReLU -> Linear(64) -> ReLU -> Linear(32) -> ReLU -> Linear(2)`. The last layer has **no activation**.
 *   **Size:** 21,794 parameters, 87 KB as `float32`. Keep them `const` so they stay in flash.
 *   **Cost:** ~22k multiply-adds per step, roughly 0.3-0.5 ms on a 240 MHz ESP32 with its FPU. Measure it on the board.
-*   **No input normalization:** the network takes the scaled frame of 4.4 directly (training used no `VecNormalize`).
+*   **No input normalization:** the network takes the scaled frame of 4.4 directly (training uses no observation normalization).
 
 ### 4.2 Control Loop Timing
-*   **Rate:** 100 Hz (10 ms per step: sim timestep 5 ms x `frame_skip` 2). Run the loop on a hardware timer, not `delay()`.
+*   **Rate:** 100 Hz (10 ms per step: `EnvironmentConfig.control_period_s`, 5 physics substeps of 2 ms). Run the loop on a hardware timer, not `delay()`.
 *   **Latency tolerated:** training delayed the motor command, the IMU and the encoders by 0-2 steps each (up to 20 ms). Keep the time from reading the sensors to writing the PWM well below one step.
 *   **Each step:**
     1. Read the IMU and the encoders.
@@ -170,7 +176,7 @@ void policy_step(const float x[88], float duty[2]) {
 *   **Supply voltage:** training assumed the no-load speed of 19.4 rad/s, i.e. the nominal battery voltage. If the battery sags, scale the duty by `V_nominal / V_battery` (clipped to [-1, 1]) so the motor sees the voltage the policy expects.
 
 ### 4.7 Exporting the Weights
-`make export` (or `PYTHONPATH=src .venv/bin/python -m self_balancing_robot.export --model <zip> --output <file.h>`) writes `models/policy_weights.h` from `models/ppo_balance.zip`. Before writing, it checks that its plain forward pass reproduces the trained policy's actions on simulated inputs. The header contains:
+`make export` (or `.venv/bin/python -m self_balancing_robot.export --model <run dir> --output <file.h>`) writes `models/policy_weights.h` from the newest training run in `models/runs/`. Before writing, it checks that its plain forward pass (NumPy, float32) reproduces the trained policy's actions (Brax's network in JAX) on simulated inputs. The header contains:
 *   `POLICY_W0..W3[out][in]` and `POLICY_B0..B3[out]`, plus `POLICY_WEIGHTS`, `POLICY_BIASES`, `POLICY_LAYER_IN` and `POLICY_LAYER_OUT` tables, so a loop over `POLICY_NUM_LAYERS` also works if the network size changes.
 *   The constants from 4.2-4.5 (`POLICY_FRAME_SIZE`, `POLICY_HISTORY_LENGTH`, `POLICY_CONTROL_PERIOD_S`, `POLICY_MAX_LINEAR_COMMAND`, `POLICY_MAX_ANGULAR_COMMAND`, `POLICY_HALF_TRACK_M`, `POLICY_WHEEL_NO_LOAD_SPEED`, `POLICY_TILT_LIMIT_RAD`) and the frame field order.
 
@@ -178,16 +184,16 @@ The arrays are `static const`: include the header in one source file only. It is
 
 The same export also writes the **policy file** `models/policy.bin` (format in the `export.py` docstring). The robot firmware (`ESP32_software/robot`) uses this instead of the header: copy it to `robot/main/policy.bin` and rebuild. Along with the weights and the constants above, the file holds:
 *   A CRC-32 of the frame field names. The firmware refuses a policy whose fields, history length, control period or limits differ from its own observation.
-*   8 simulated observations and SB3's actions for them. The firmware checks its forward pass against these at boot (4.9, step 1).
+*   8 simulated observations and the trained policy's actions for them. The firmware checks its forward pass against these at boot (4.9, step 1).
 *   A CRC-32 of the whole file, which also identifies the policy in the firmware log.
 
 ### 4.8 What the Policy Was Trained to Handle
 *   Mass +-10%, CoM shift up to 8 mm per axis, floor friction +-40%, slopes up to 0.3 rad, pushes up to 1 N for 0.1 s, sensor noise and 0-2 steps of latency (see `RandomizationConfig` in `config.py`).
 *   Known weaknesses (`models/archive/v10_reversals_30M/README.md`): forward speed undershoots by ~20%, a forward CoM shift turns into a speed offset (no integral term), and survival on slopes above 0.2 rad is low.
-*   Training ends an episode when roll or pitch passes 0.6 rad or the chassis touches the ground: past that the policy has never been trained, so cut the motors there.
+*   Training ends an episode when roll or pitch passes 0.6 rad, the robot spins faster than 3 rad/s, or the chassis touches the ground: past that the policy has never been trained, so cut the motors there.
 
 ### 4.9 Bring-Up Checklist
-1. **Forward pass:** log a few real 88-value inputs, run them through the Python model (`model.predict(obs, deterministic=True)` with the 88 values at the front of a zero observation) and compare with the ESP32 outputs (should agree to ~1e-5).
+1. **Forward pass:** log a few real 88-value inputs, run them through the Python model (`Actor.load(path).predict(obs)` from `actor.py`, for a run directory or a `policy.bin`) and compare with the ESP32 outputs (should agree to ~1e-5).
 2. **Signs:** with the robot held, tilt it, turn it and spin each wheel by hand, and check every row of 4.3 in the logged frame.
 3. **Motors:** a small positive duty on each wheel must roll the robot forward.
 4. **Timing:** measure the loop period (10 ms) and the sensor-to-PWM time.

@@ -62,9 +62,12 @@ class CurriculumConfig:
     reversal_probability: float = 0.2
     reversal_min_fraction: float = 0.75
 
-    # An environment moves up a level (or, at the last level, to the next stage) once it has
-    # played the minimum number of episodes at the level and, over its last
-    # `evaluation_window` episodes:
+    # The curriculum is global: every environment trains at the same stage and level (with
+    # thousands of GPU environments each one only finishes a few dozen episodes per run, too few
+    # for a per-environment window). Episodes that finish at the current level are pooled in
+    # windows of `evaluation_window` episodes; training moves up a level (or, at the last
+    # level, to the next stage) once the minimum number of episodes was played at the level
+    # and a window:
     #  - survived at least the success rate;
     #  - reached the speed ratio: speed along the command / commanded speed, counting
     #    commands of at least `speed_ratio_min_fraction` of the level's maximum (and at least
@@ -78,23 +81,23 @@ class CurriculumConfig:
     # back to standing still (36% -> 4% of the command from 3M to 5M steps).
     command_levels: int = 3
     command_level_success_rate: float = 0.95
-    command_min_episodes_per_level: int = 40
+    command_min_episodes_per_level: int = 2_000
     command_speed_ratio: float = 0.90
     command_still_speed_limit: float = 0.02
     randomization_levels: int = 6
     # Slopes cost speed uphill (at 0.3 rad, 0.4 m/s took almost full duty), so the ratio is
     # a bit lower here; v6 (85% survival, no speed check) drifted back to ~70% of the command.
     randomization_level_success_rate: float = 0.90
-    randomization_min_episodes_per_level: int = 100
+    randomization_min_episodes_per_level: int = 5_000
     randomization_speed_ratio: float = 0.85
     randomization_still_speed_limit: float = 0.05
-    # Episodes with a reversal must also survive on their own (~7 of a 20-episode window
-    # have one, so one fall among them is allowed).
+    # Episodes with a reversal must also survive on their own (about a third of the episodes
+    # have one).
     reversal_success_rate: float = 0.85
     speed_ratio_min_fraction: float = 1.0 / 3.0
     speed_ratio_min_command: float = 0.05
     speed_ratio_settle_seconds: float = 1.0
-    evaluation_window: int = 20
+    evaluation_window: int = 1_000
 
 
 @dataclass(frozen=True)
@@ -122,13 +125,25 @@ class RandomizationConfig:
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
-    model_file: str = "XML-test.xml"
-    frame_skip: int = 2
+    model_file: str = "env_v0.xml"
+    # Policy period, as on the ESP32; the physics runs `control_period_s / timestep` substeps
+    # per action (timestep from the XML).
+    control_period_s: float = 0.01
+    # Constraint solver limits of the MJX model. Batched, every environment waits for the
+    # slowest one, so MuJoCo's defaults (100 / 50) cost ~2.6x the time of 4 / 8 at 4096
+    # environments; with at most 10 contacts the Newton solver converges in a few iterations.
+    solver_iterations: int = 4
+    solver_ls_iterations: int = 8
     max_episode_steps: int = 1_000
     history_length: int = 8
     initial_state_noise: float = 0.02
     initial_pitch_radians: float = 0.1
     upright_limit_radians: float = 0.6
+    # Spinning faster than twice the largest yaw command ends the episode like a fall. Without
+    # it, PPO on the GPU sometimes learned to balance while spinning in place at ~8 rad/s
+    # (early on, spinning kept a barely trained robot up for longer), and the narrow yaw-rate
+    # kernel gives no gradient back from that far away.
+    yaw_rate_limit_rad_s: float = 3.0
     camera_distance_m: float = 0.8
     camera_elevation_degrees: float = -20.0
     camera_azimuth_degrees: float = 45.0
@@ -140,33 +155,36 @@ class PolicyConfig:
     # multiply-adds per step), still far below the ESP32's flash and the 10 ms control step.
     actor_layers: tuple[int, ...] = (128, 64, 32)
     critic_layers: tuple[int, ...] = (128, 64)
-    log_std_init: float = -0.5
+    # Initial action noise std (exp(-0.5), SB3's log_std_init of the earlier runs).
+    init_noise_std: float = 0.6065
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    total_timesteps: int = 20_000_000
-    output_path: Path = Path("models/ppo_balance")
-    checkpoint_path: Path = Path("models/checkpoints")
-    checkpoint_frequency: int = 1_000_000
-    seed: int = 7
-    evaluation_frequency: int = 200_000
-    evaluation_episodes: int = 5
-    evaluation_max_steps: int = 1_000
-    evaluation_seed_offset: int = 1_000_000
-    parallel_environments: int = 8
-    n_steps: int = 1024
-    batch_size: int = 2048
-    n_epochs: int = 5
+    # Brax PPO on GPU. One PPO iteration collects num_envs * unroll_length steps and splits
+    # them into num_minibatches minibatches (num_envs must be a multiple of num_minibatches).
+    total_timesteps: int = 200_000_000
+    num_envs: int = 4096
+    unroll_length: int = 32
+    num_minibatches: int = 16
+    num_updates_per_batch: int = 4
     learning_rate: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.0
-    evaluation_model_path: Path = Path("models/ppo_balance.zip")
-    plot_dir: Path = Path("plots")
-    video_path: Path = Path("videos")
-    video_frequency: int = 1_000_000
+    entropy_cost: float = 0.01
+    max_grad_norm: float = 1.0
+    seed: int = 7
+    run_dir: Path = Path("models/runs")
+    # Every `evaluation_frequency` steps training pauses to save a checkpoint and run
+    # `evaluation_episodes` deterministic episodes at the current level and at the final
+    # difficulty (in parallel on the GPU) for the plots and TensorBoard.
+    evaluation_frequency: int = 5_000_000
+    evaluation_episodes: int = 32
+    evaluation_max_steps: int = 1_000
+    evaluation_seed_offset: int = 1_000_000
+    video_frequency: int = 25_000_000
+    log_dir: Path = Path("logs")
 
 
 DEFAULT_REWARD_CONFIG = RewardConfig()

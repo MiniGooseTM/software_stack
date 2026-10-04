@@ -1,4 +1,4 @@
-"""Quick check that XML-test.xml loads in MuJoCo.
+"""Quick check that env_v0.xml (goose.xml on the ground plane) loads in MuJoCo.
 
 Usage:
     python model_test.py          # load and print a short summary

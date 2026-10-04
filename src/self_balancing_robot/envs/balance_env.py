@@ -1,14 +1,24 @@
+"""MuJoCo MJX environment of the two-wheel robot, written for JAX (jit/vmap on GPU).
+
+The environment is functional: `reset(rng)` and `step(state, action)` return a new
+`State` and keep everything that changes over an episode (command, sensor and action
+buffers, randomized physics, curriculum stage and level) in `state.info`. Training runs
+thousands of copies with `jax.vmap` (see `envs/wrappers.py`); evaluation, teleop and
+export run single copies through `jax.jit`, on GPU or CPU.
+"""
+
 from __future__ import annotations
 
-from collections import deque
 from pathlib import Path
-from typing import ClassVar
+from typing import Any
 
-import gymnasium as gym
+import jax
+import jax.numpy as jnp
 import mujoco
 import numpy as np
-from gymnasium import spaces
-from gymnasium.envs.mujoco import MujocoEnv
+from ml_collections import config_dict
+from mujoco import mjx
+from mujoco_playground._src import mjx_env
 
 from self_balancing_robot.config import (
     DEFAULT_CURRICULUM_CONFIG,
@@ -21,6 +31,10 @@ from self_balancing_robot.config import (
     RandomizationConfig,
     RewardConfig,
 )
+
+State = mjx_env.State
+
+ASSETS = Path(__file__).parents[1] / "assets"
 
 # One proprioceptive frame O_t, as the ESP32 builds it. The actor sees the last
 # `history_length` frames, newest first. Commands are divided by the full command range
@@ -63,53 +77,122 @@ PRIVILEGED_FIELDS = (
 )
 PRIVILEGED_SIZE = len(PRIVILEGED_FIELDS)
 
+# Observation keys: the actor (ESP32 policy) reads "state", the critic "privileged_state".
+ACTOR_KEY = "state"
+CRITIC_KEY = "privileged_state"
 
-def _normalized(value: float | np.ndarray, limit: float) -> float | np.ndarray:
-    return value / limit if limit > 0 else value * 0.0
+# Info entries carried over from one episode to the next by `reset_episode`: the curriculum
+# position and the teleop settings (held command, pinned physics; NaN = not pinned).
+PERSISTENT_KEYS = (
+    "stage",
+    "level",
+    "command_held",
+    "command",
+    "override_slope",
+    "override_friction",
+    "override_com",
+)
+
+# Per-step values summed over an episode by the training and evaluation wrappers.
+METRIC_NAMES = ("linear_error", "angular_error", "abs_pitch_deg", "survived")
+REWARD_TERMS = ("alive", "pitch_rate", "linear_velocity", "angular_velocity", "action", "smoothness")
 
 
 def _tracking_kernel(
-    error: float, narrow_variance: float, wide_variance: float, wide_fraction: float
-) -> float:
+    error: jax.Array, narrow_variance: float, wide_variance: float, wide_fraction: float
+) -> jax.Array:
     """Blend of a narrow and a wide Gaussian kernel, bounded in [0, 1]."""
-    return float(
-        (1.0 - wide_fraction) * np.exp(-(error**2) / narrow_variance)
-        + wide_fraction * np.exp(-(error**2) / wide_variance)
+    return (1.0 - wide_fraction) * jnp.exp(-(error**2) / narrow_variance) + wide_fraction * jnp.exp(
+        -(error**2) / wide_variance
     )
 
 
-class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
+def _normalized(value: jax.Array, limit: float) -> jax.Array:
+    return value / limit if limit > 0 else value * 0.0
+
+
+# ----------------------------------------------------------------- quaternions (w, x, y, z)
+
+
+def quat_mul(a: jax.Array, b: jax.Array) -> jax.Array:
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return jnp.array(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ]
+    )
+
+
+def axis_angle_quat(axis: jax.Array, angle: jax.Array) -> jax.Array:
+    axis = jnp.asarray(axis, dtype=jnp.float32)
+    return jnp.concatenate([jnp.cos(angle / 2)[None], jnp.sin(angle / 2) * axis])
+
+
+def quat_to_mat(q: jax.Array) -> jax.Array:
+    """Rotation matrix whose columns are the body axes in world coordinates."""
+    w, x, y, z = q / jnp.linalg.norm(q)
+    return jnp.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def rotate(vector: jax.Array, q: jax.Array) -> jax.Array:
+    return quat_to_mat(q) @ vector
+
+
+def tilt(rotation: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """(roll, pitch) from the gravity direction in the body frame, as an accelerometer at
+    rest would see it. Body axes: x = wheel axle (pitch), y = forward (roll), z = up."""
+    up = rotation[2]
+    pitch = jnp.arctan2(up[1], up[2])
+    roll = jnp.arctan2(-up[0], jnp.hypot(up[1], up[2]))
+    return roll, pitch
+
+
+def load_model(model_file: str, collision_only: bool = False) -> mujoco.MjModel:
+    """Load the MuJoCo model; `collision_only` drops the visual meshes (MJX training model)."""
+    spec = mujoco.MjSpec.from_file(str(ASSETS / model_file))
+    if collision_only:
+        for geom in list(spec.geoms):
+            if geom.contype == 0 and geom.conaffinity == 0:
+                spec.delete(geom)
+        for mesh in list(spec.meshes):
+            spec.delete(mesh)
+    return spec.compile()
+
+
+class SelfBalancingRobotEnv(mjx_env.MjxEnv):
     """3D two-wheel robot for asymmetric actor-critic PPO with curriculum learning.
 
-    The observation is ``[actor_history, privileged_state]``. The first
-    ``actor_observation_size`` entries are what the deployed policy receives;
-    the rest is only used by the critic during training.
-    """
+    The observation is ``{"state": actor_history, "privileged_state": privileged_state}``.
+    ``state`` (``actor_observation_size`` values) is what the deployed policy receives;
+    ``privileged_state`` is only used by the critic during training.
 
-    metadata: ClassVar = {
-        "render_modes": ["human", "rgb_array", "depth_array"],
-    }
+    ``curriculum_stage`` and ``difficulty_level`` set where new episodes start; during
+    training the curriculum wrapper moves them (see `envs/wrappers.py`) unless
+    ``fixed_difficulty`` is set.
+    """
 
     def __init__(
         self,
-        render_mode: str | None = None,
         reward_config: RewardConfig | None = None,
         curriculum_config: CurriculumConfig | None = None,
         randomization_config: RandomizationConfig | None = None,
         environment_config: EnvironmentConfig | None = None,
         max_episode_steps: int | None = None,
         curriculum_stage: int = CurriculumStage.STABILIZATION,
+        difficulty_level: int = 1,
+        fixed_difficulty: bool = False,
+        impl: str = "jax",
     ):
-        gym.utils.EzPickle.__init__(
-            self,
-            render_mode,
-            reward_config,
-            curriculum_config,
-            randomization_config,
-            environment_config,
-            max_episode_steps,
-            curriculum_stage,
-        )
         self.environment_config = environment_config or DEFAULT_ENVIRONMENT_CONFIG
         self.reward_config = reward_config or DEFAULT_REWARD_CONFIG
         self.curriculum_config = curriculum_config or DEFAULT_CURRICULUM_CONFIG
@@ -122,234 +205,145 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         self.history_length = self.environment_config.history_length
         self.actor_observation_size = ACTOR_FRAME_SIZE * self.history_length
         self.privileged_observation_size = PRIVILEGED_SIZE
-        self._camera_config = {
-            "type": mujoco.mjtCamera.mjCAMERA_TRACKING,
-            "distance": self.environment_config.camera_distance_m,
-            "elevation": self.environment_config.camera_elevation_degrees,
-            "azimuth": self.environment_config.camera_azimuth_degrees,
-        }
-        xml_path = Path(__file__).parents[1] / "assets" / self.environment_config.model_file
-        MujocoEnv.__init__(
-            self,
-            model_path=str(xml_path),
-            frame_skip=self.environment_config.frame_skip,
-            observation_space=spaces.Box(
-                -np.inf,
-                np.inf,
-                shape=(self.actor_observation_size + self.privileged_observation_size,),
-                dtype=np.float64,
-            ),
-            default_camera_config=self._camera_config,
-            render_mode=render_mode,
-        )
-        self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
 
-        self._base_body_id = self.model.body("base_link").id
-        self._camera_config["trackbodyid"] = self._base_body_id
-        self._ground_geom_id = self.model.geom("ground").id
-        self._base_geom_id = self.model.geom("base_link_collision").id
-        base_joint = self.model.joint("base_link_joint")
+        # Full model (meshes) for rendering; the MJX model only has the collision geoms.
+        # Both have the same bodies, joints and qpos layout.
+        self._render_model = load_model(self.environment_config.model_file)
+        self._mj_model = load_model(self.environment_config.model_file, collision_only=True)
+        self._mj_model.opt.iterations = self.environment_config.solver_iterations
+        self._mj_model.opt.ls_iterations = self.environment_config.solver_ls_iterations
+        timestep = float(self._mj_model.opt.timestep)
+        substeps = max(round(self.environment_config.control_period_s / timestep), 1)
+        super().__init__(config_dict.create(ctrl_dt=substeps * timestep, sim_dt=timestep))
+        self._impl = impl
+        self._mjx_model = mjx.put_model(self._mj_model, impl=impl)
+
+        model = self._mj_model
+        self._base_body_id = model.body("base_link").id
+        self._ground_geom_id = model.geom("ground").id
+        self._base_geom_id = model.geom("base_link_collision").id
+        base_joint = model.joint("base_link_joint")
         self._base_qpos = int(base_joint.qposadr[0])
         self._base_qvel = int(base_joint.dofadr[0])
-        wheel_joints = [self.model.joint(name) for name in ("left_wheel_joint", "right_wheel_joint")]
-        self._wheel_qvel = np.array([int(joint.dofadr[0]) for joint in wheel_joints])
+        self._wheel_qvel = np.array(
+            [int(model.joint(name).dofadr[0]) for name in ("left_wheel_joint", "right_wheel_joint")]
+        )
         # Normalized action a in [-1, 1] is the PWM duty; the velocity actuator turns
         # duty * no-load speed into DC-motor torque.
-        self._max_wheel_speed = float(self.model.actuator_ctrlrange[:, 1].min())
-        self._wheel_radius = float(self.model.geom("left_wheel_collision").size[0])
-        mujoco.mj_forward(self.model, self.data)
-        self._half_track = 0.5 * float(
-            np.linalg.norm(
-                self.data.geom("left_wheel_collision").xpos
-                - self.data.geom("right_wheel_collision").xpos
-            )
-        )
+        self._max_wheel_speed = float(model.actuator_ctrlrange[:, 1].min())
+        self._wheel_radius = float(model.geom("left_wheel_collision").size[0])
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        left = data.geom("left_wheel_collision").xpos
+        right = data.geom("right_wheel_collision").xpos
+        self._half_track = 0.5 * float(np.linalg.norm(left - right))
+        # Speeds are measured at the middle of the axle, not at the body origin (which sits
+        # off-centre, so turning would add a fake forward speed there).
+        base_rotation = data.xmat[self._base_body_id].reshape(3, 3)
+        self._axle_center = base_rotation.T @ (0.5 * (left + right) - data.xpos[self._base_body_id])
 
-        self._nominal_mass = float(self.model.body_mass[self._base_body_id])
-        self._nominal_inertia = self.model.body_inertia[self._base_body_id].copy()
-        self._nominal_com = self.model.body_ipos[self._base_body_id].copy()
-        self._nominal_friction = self.model.geom_friction.copy()
-        self._terrain_mocap_id = int(self.model.body("terrain").mocapid[0])
-        self._nominal_ground_friction = float(self._nominal_friction[self._ground_geom_id, 0])
-        self._max_com_offset = self.randomization_config.center_of_mass_offset_m
+        self._nominal_mass = float(model.body_mass[self._base_body_id])
+        self._nominal_inertia = model.body_inertia[self._base_body_id].copy()
+        self._nominal_com = model.body_ipos[self._base_body_id].copy()
+        self._nominal_ground_friction = float(model.geom_friction[self._ground_geom_id, 0])
+        self._init_qpos = model.qpos0.copy()
 
-        self._stage = CurriculumStage(curriculum_stage)
-        self._difficulty_level = 1
-        self._stage_results: deque[bool] = deque(maxlen=self.curriculum_config.evaluation_window)
-        self._command = np.zeros(2, dtype=np.float64)
-        self._command_time_remaining = 0.0
-        self._command_held = False
-        self._command_age = 0.0
-        self._physics_overrides: dict[str, float | np.ndarray] = {}
-        self._episode_step = 0
-        # Per-episode sums for the level-up checks: (speed reached along the command,
-        # commanded speed, |v| on zero speed commands, steps on zero speed commands).
-        self._episode_tracking = np.zeros(4)
-        self._stage_tracking: deque[np.ndarray] = deque(
-            maxlen=self.curriculum_config.evaluation_window
-        )
-        # Whether this episode had a reversal command, and (had one, survived) per episode.
-        self._episode_reversal = False
-        self._stage_reversals: deque[tuple[bool, bool]] = deque(
-            maxlen=self.curriculum_config.evaluation_window
-        )
-        self._level_episodes = 0
-        self._previous_action = np.zeros(2, dtype=np.float64)
-        self._action_queue: deque[np.ndarray] = deque()
-        self._sensor_buffer: deque[np.ndarray] = deque()
-        self._history: deque[np.ndarray] = deque(maxlen=self.history_length)
-        self._motor_latency = 0
-        self._imu_latency = 0
-        self._encoder_latency = 0
-        self._mass_scale = 1.0
-        self._friction_scale = 1.0
-        self._com_offset = np.zeros(3)
-        self._ground_normal = np.array([0.0, 0.0, 1.0])
-        self._slope = 0.0
-        self._push_force = np.zeros(2)
-        self._push_end_time = 0.0
-        self._next_impulse_time = np.inf
+        mjx_data = mjx.make_data(self._mjx_model)
+        contact_geoms = np.asarray(mjx_data._impl.contact.geom)
+        pair = {self._ground_geom_id, self._base_geom_id}
+        self._base_contacts = np.array([set(map(int, g)) == pair for g in contact_geoms])
 
-    def _initialize_simulation(self):
-        model, data = super()._initialize_simulation()
-        self.metadata = {
-            **type(self).metadata,
-            "render_fps": int(
-                np.round(1.0 / (model.opt.timestep * self.environment_config.frame_skip))
-            ),
-        }
-        return model, data
+        # Evaluation environments stay at their stage and level (no curriculum).
+        self.fixed_difficulty = fixed_difficulty
+        self.start_stage = int(CurriculumStage(curriculum_stage))
+        self.start_level = int(np.clip(difficulty_level, 1, self.max_level(self.start_stage)))
+
+    # ------------------------------------------------------------------ MjxEnv interface
 
     @property
-    def curriculum_stage(self) -> int:
-        return int(self._stage)
-
-    def set_curriculum_stage(self, stage: int) -> None:
-        """Change the stage (starting at its level 1); applies at the next reset."""
-        self._stage = CurriculumStage(stage)
-        self.set_difficulty_level(1)
+    def xml_path(self) -> str:
+        return str(ASSETS / self.environment_config.model_file)
 
     @property
-    def max_level(self) -> int:
-        """Number of levels of the current stage (1 for stage 1)."""
+    def action_size(self) -> int:
+        return 2
+
+    @property
+    def mj_model(self) -> mujoco.MjModel:
+        """Model with the visual meshes (rendering); same qpos layout as the MJX model."""
+        return self._render_model
+
+    @property
+    def mjx_model(self) -> mjx.Model:
+        return self._mjx_model
+
+    @property
+    def half_track(self) -> float:
+        return self._half_track
+
+    @property
+    def max_wheel_speed(self) -> float:
+        return self._max_wheel_speed
+
+    @property
+    def nominal_ground_friction(self) -> float:
+        return self._nominal_ground_friction
+
+    # ------------------------------------------------------------------ curriculum
+
+    def max_level(self, stage) -> Any:
+        """Number of levels of a stage (1 for stage 1); works on Python ints and arrays."""
         cfg = self.curriculum_config
-        return {
-            CurriculumStage.STABILIZATION: 1,
-            CurriculumStage.COMMAND_RAMP: cfg.command_levels,
-            CurriculumStage.DOMAIN_RANDOMIZATION: cfg.randomization_levels,
-        }[self._stage]
+        levels = (1, cfg.command_levels, cfg.randomization_levels)
+        if isinstance(stage, (int, np.integer)):
+            return levels[int(stage) - 1]
+        return jnp.array(levels)[stage - 1]
 
-    @property
-    def difficulty_level(self) -> int:
-        """Level within the current stage, 1 .. ``max_level``."""
-        return self._difficulty_level
+    def _level_fraction(self, stage, level) -> jax.Array:
+        return level / self.max_level(stage)
 
-    @property
-    def curriculum_progress(self) -> float:
-        """Stage plus the fraction of its levels passed, e.g. 2.5 = halfway through stage 2."""
-        return self._stage + (self._difficulty_level - 1) / self.max_level
+    def command_limits(self, stage, level) -> jax.Array:
+        """Maximum |v_cmd| (m/s) and |omega_cmd| (rad/s) at a stage and level."""
+        fraction = jnp.where(
+            stage == CurriculumStage.COMMAND_RAMP, self._level_fraction(stage, level), 1.0
+        )
+        fraction = jnp.where(stage == CurriculumStage.STABILIZATION, 0.0, fraction)
+        return fraction * jnp.asarray(self.curriculum_config.command_limits)
 
-    def set_difficulty_level(self, level: int) -> None:
-        """Set the level of the current stage and restart the advancement statistics."""
-        self._difficulty_level = int(np.clip(level, 1, self.max_level))
-        self._level_episodes = 0
-        self._stage_results.clear()
-        self._stage_tracking.clear()
-        self._stage_reversals.clear()
+    def _randomization_fraction(self, stage, level) -> jax.Array:
+        return jnp.where(
+            stage >= CurriculumStage.DOMAIN_RANDOMIZATION, self._level_fraction(stage, level), 0.0
+        )
 
-    @property
-    def command_limits(self) -> tuple[float, float]:
-        """Current maximum |v_cmd| (m/s) and |omega_cmd| (rad/s)."""
-        linear, angular = self.curriculum_config.command_limits
-        if self._stage == CurriculumStage.STABILIZATION:
-            return 0.0, 0.0
-        fraction = self._level_fraction() if self._stage == CurriculumStage.COMMAND_RAMP else 1.0
-        return fraction * linear, fraction * angular
+    def slope_limit(self, stage, level) -> jax.Array:
+        return self._randomization_fraction(stage, level) * self.randomization_config.slope_radians
 
-    @property
-    def slope_limit(self) -> float:
-        """Current maximum terrain slope (rad)."""
-        return self._randomization_fraction() * self.randomization_config.slope_radians
+    def push_limit(self, stage, level) -> jax.Array:
+        return self._randomization_fraction(stage, level) * self.randomization_config.impulse_force_n
 
-    @property
-    def push_limit(self) -> float:
-        """Current maximum push force (N)."""
-        return self._randomization_fraction() * self.randomization_config.impulse_force_n
+    def com_offset_limit(self, stage, level) -> jax.Array:
+        return (
+            self._randomization_fraction(stage, level)
+            * self.randomization_config.center_of_mass_offset_m
+        )
 
-    @property
-    def com_offset_limit(self) -> float:
-        """Current maximum CoM shift per axis (m)."""
-        return self._randomization_fraction() * self.randomization_config.center_of_mass_offset_m
-
-    def _level_fraction(self) -> float:
-        return self._difficulty_level / self.max_level
-
-    def _randomization_fraction(self) -> float:
-        if self._stage < CurriculumStage.DOMAIN_RANDOMIZATION:
-            return 0.0
-        return self._level_fraction()
-
-    def _sample_level_magnitude(self, limit: float, level: int | None = None) -> float:
+    def sample_level_magnitude(self, rng: jax.Array, limit: jax.Array, level) -> jax.Array:
         """Magnitude in [0, limit] weighted towards the newest band of ``level`` (see config)."""
         cfg = self.curriculum_config
-        level = self._difficulty_level if level is None else level
-        band_floor = max(limit - limit / level, 0.0)
-        draw = self.np_random.uniform()
-        if draw < cfg.level_zero_probability:
-            return 0.0
+        draw_key, frontier_key, below_key = jax.random.split(rng, 3)
+        band_floor = jnp.maximum(limit - limit / level, 0.0)
+        draw = jax.random.uniform(draw_key)
+        frontier = jax.random.uniform(frontier_key, minval=band_floor, maxval=limit)
+        below = jax.random.uniform(below_key, minval=0.0, maxval=band_floor)
         # At level 1 nothing lies below the newest band, so that share goes to the band.
-        if draw < cfg.level_zero_probability + cfg.level_frontier_probability or not band_floor:
-            return float(self.np_random.uniform(band_floor, limit))
-        return float(self.np_random.uniform(0.0, band_floor))
+        use_frontier = (draw < cfg.level_zero_probability + cfg.level_frontier_probability) | (
+            band_floor <= 0.0
+        )
+        return jnp.where(
+            draw < cfg.level_zero_probability, 0.0, jnp.where(use_frontier, frontier, below)
+        )
 
-    @property
-    def command(self) -> np.ndarray:
-        return self._command.copy()
-
-    def set_physics(
-        self,
-        slope: float | None = None,
-        friction: float | None = None,
-        com_offset: np.ndarray | None = None,
-    ) -> None:
-        """Pin physics values instead of randomizing them (e.g. from the teleop window).
-
-        ``slope`` is the terrain incline in rad (rising along world +y), ``friction`` the
-        floor friction coefficient and ``com_offset`` the CoM shift in m (body frame:
-        x = axle, y = forward, z = up). Friction and CoM take effect immediately, the slope
-        at the next reset, which places the robot on it. ``None`` keeps the current setting.
-        """
-        if slope is not None:
-            self._physics_overrides["slope"] = float(slope)
-        if friction is not None:
-            self._physics_overrides["friction"] = float(friction)
-            self._friction_scale = float(friction) / self._nominal_ground_friction
-        if com_offset is not None:
-            self._physics_overrides["com_offset"] = np.asarray(com_offset, dtype=np.float64)
-            self._com_offset = self._physics_overrides["com_offset"].copy()
-        self._apply_physics()
-
-    def clear_physics(self) -> None:
-        """Return slope, friction and CoM to the curriculum's randomization at the next reset."""
-        self._physics_overrides.clear()
-
-    @property
-    def physics(self) -> dict[str, float | np.ndarray]:
-        """Current slope (rad), floor friction coefficient and CoM offset (m)."""
-        return {
-            "slope": self._slope,
-            "friction": self._friction_scale * self._nominal_ground_friction,
-            "com_offset": self._com_offset.copy(),
-        }
-
-    def hold_command(self, linear_velocity: float, angular_velocity: float) -> None:
-        """Use a fixed command (e.g. from a joystick) instead of the curriculum's random ones."""
-        self._command[:] = self.wheel_feasible_command(linear_velocity, angular_velocity)
-        self._command_held = True
-
-    def wheel_feasible_command(
-        self, linear_velocity: float, angular_velocity: float
-    ) -> tuple[float, float]:
+    def wheel_feasible_command(self, linear_velocity, angular_velocity) -> jax.Array:
         """Scale (v, omega) down together so the outer wheel stays within full speed.
 
         At 0.4 m/s and 1.5 rad/s the outer wheel would need ~0.5 m/s, more than the motors
@@ -358,354 +352,423 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         the same way.
         """
         full_speed = self.curriculum_config.command_limits[0]
-        outer_wheel = abs(linear_velocity) + abs(angular_velocity) * self._half_track
-        scale = min(1.0, full_speed / outer_wheel) if outer_wheel > 0 else 1.0
-        return linear_velocity * scale, angular_velocity * scale
+        outer_wheel = jnp.abs(linear_velocity) + jnp.abs(angular_velocity) * self._half_track
+        scale = jnp.where(
+            outer_wheel > 0, jnp.minimum(1.0, full_speed / jnp.maximum(outer_wheel, 1e-9)), 1.0
+        )
+        return jnp.stack([linear_velocity * scale, angular_velocity * scale])
 
-    # ------------------------------------------------------------------ state
+    def _sample_command(
+        self, rng: jax.Array, info: dict, allow_reversal: bool
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """New (command, time until the next one, whether it is a reversal).
 
-    def _rotation(self) -> np.ndarray:
-        return self.data.xmat[self._base_body_id].reshape(3, 3)
+        Stage 2 favours the newest command band; stage 3 (full range, slopes and pushes)
+        draws 0 or uniform. Stage 1 limits are 0. Mid-episode, some changes are reversals.
+        """
+        cfg = self.curriculum_config
+        keys = jax.random.split(rng, 8)
+        stage, level = info["stage"], info["level"]
+        limits = self.command_limits(stage, level)
+        previous = info["command"][0]
+        direction = jnp.where(
+            previous != 0,
+            -jnp.sign(previous),
+            jnp.where(jax.random.bernoulli(keys[0]), 1.0, -1.0),
+        )
+        speed = jax.random.uniform(keys[1], minval=cfg.reversal_min_fraction, maxval=1.0)
+        reversal_command = jnp.stack([direction * speed * limits[0], 0.0])
+        reversal = (
+            allow_reversal & (limits[0] > 0) & (jax.random.uniform(keys[2]) < cfg.reversal_probability)
+        )
+        sample_level = jnp.where(stage == CurriculumStage.DOMAIN_RANDOMIZATION, 1, level)
+        signs = jnp.where(jax.random.bernoulli(keys[3], shape=(2,)), 1.0, -1.0)
+        random_command = self.wheel_feasible_command(
+            self.sample_level_magnitude(keys[4], limits[0], sample_level) * signs[0],
+            self.sample_level_magnitude(keys[5], limits[1], sample_level) * signs[1],
+        )
+        command = jnp.where(reversal, reversal_command, random_command)
+        duration = jax.random.uniform(
+            keys[6],
+            minval=cfg.command_resample_seconds[0],
+            maxval=cfg.command_resample_seconds[1],
+        )
+        return command, duration, reversal
 
-    def _heading_axes(self) -> tuple[np.ndarray, np.ndarray]:
+    # ------------------------------------------------------------------ physics
+
+    def _episode_model(self, info: dict) -> mjx.Model:
+        """MJX model with this episode's mass, CoM and friction."""
+        model = self._mjx_model
+        base = self._base_body_id
+        return model.replace(
+            body_mass=model.body_mass.at[base].set(self._nominal_mass * info["mass_scale"]),
+            body_inertia=model.body_inertia.at[base].set(
+                self._nominal_inertia * info["mass_scale"]
+            ),
+            body_ipos=model.body_ipos.at[base].set(self._nominal_com + info["com_offset"]),
+            # MuJoCo uses the larger friction of the two contacting geoms, so scale all.
+            geom_friction=model.geom_friction.at[:, 0].multiply(info["friction_scale"]),
+        )
+
+    def _rotation(self, qpos: jax.Array) -> jax.Array:
+        return quat_to_mat(qpos[self._base_qpos + 3 : self._base_qpos + 7])
+
+    @staticmethod
+    def heading_axes(rotation: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Unit forward and lateral vectors of the robot projected on the world xy-plane."""
-        forward = self._rotation()[:2, 1].copy()
-        forward /= max(np.linalg.norm(forward), 1e-9)
-        lateral = np.array([forward[1], -forward[0]])
+        forward = rotation[:2, 1]
+        forward = forward / jnp.maximum(jnp.linalg.norm(forward), 1e-9)
+        lateral = jnp.stack([forward[1], -forward[0]])
         return forward, lateral
 
-    def _tilt(self) -> tuple[float, float]:
-        # Gravity direction in the body frame, as an accelerometer at rest would see it.
-        # Body axes: x = wheel axle (pitch), y = forward (roll), z = up.
-        up = self._rotation()[2]
-        pitch = np.arctan2(up[1], up[2])
-        roll = np.arctan2(-up[0], np.hypot(up[1], up[2]))
-        return float(roll), float(pitch)
-
-    def _imu_measurement(self) -> np.ndarray:
-        roll, pitch = self._tilt()
-        pitch_rate, roll_rate, yaw_rate = self.data.qvel[self._base_qvel + 3 : self._base_qvel + 6]
-        return np.array([roll, pitch, roll_rate, pitch_rate, yaw_rate])
-
-    def _encoder_measurement(self) -> np.ndarray:
-        return self.data.qvel[self._wheel_qvel] / self._max_wheel_speed
-
-    def _body_velocities(self) -> tuple[float, float, float]:
-        """True forward speed, lateral speed and world yaw rate."""
-        forward, lateral = self._heading_axes()
-        linear = self.data.qvel[self._base_qvel : self._base_qvel + 2]
-        angular_body = self.data.qvel[self._base_qvel + 3 : self._base_qvel + 6]
-        yaw_rate = float((self._rotation() @ angular_body)[2])
-        return float(linear @ forward), float(linear @ lateral), yaw_rate
-
-    def _clean_frame(self) -> np.ndarray:
-        return np.concatenate(
-            (
-                self._scaled_command(),
-                self._imu_measurement(),
-                self._encoder_measurement(),
-                self._previous_action,
-            )
+    def _body_velocities(
+        self, rotation: jax.Array, qvel: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """True forward speed and lateral speed of the axle centre, and world yaw rate."""
+        forward, lateral = self.heading_axes(rotation)
+        angular_world = rotation @ qvel[self._base_qvel + 3 : self._base_qvel + 6]
+        # Free joint: linear velocity of the body origin in world frame.
+        linear = qvel[self._base_qvel : self._base_qvel + 3] + jnp.cross(
+            angular_world, rotation @ self._axle_center
         )
+        return linear[:2] @ forward, linear[:2] @ lateral, angular_world[2]
 
-    def _actor_frame(self) -> np.ndarray:
-        """Delayed, noisy measurements as the onboard sensors would report them."""
-        self._sensor_buffer.appendleft(
-            np.concatenate((self._imu_measurement(), self._encoder_measurement()))
-        )
-        while len(self._sensor_buffer) > self._max_sensor_latency() + 1:
-            self._sensor_buffer.pop()
-        oldest = len(self._sensor_buffer) - 1
-        imu = self._sensor_buffer[min(self._imu_latency, oldest)][:5].copy()
-        encoders = self._sensor_buffer[min(self._encoder_latency, oldest)][5:].copy()
-        if self._stage >= CurriculumStage.DOMAIN_RANDOMIZATION:
-            cfg = self.randomization_config
-            imu[:2] += self.np_random.normal(0.0, cfg.imu_angle_noise_rad, size=2)
-            imu[2:] += self.np_random.normal(0.0, cfg.imu_rate_noise_rad_s, size=3)
-            encoders += self.np_random.normal(
-                0.0, cfg.encoder_velocity_noise_rad_s / self._max_wheel_speed, size=2
-            )
-        return np.concatenate((self._scaled_command(), imu, encoders, self._previous_action))
+    def _imu_measurement(self, rotation: jax.Array, qvel: jax.Array) -> jax.Array:
+        roll, pitch = tilt(rotation)
+        pitch_rate, roll_rate, yaw_rate = qvel[self._base_qvel + 3 : self._base_qvel + 6]
+        return jnp.stack([roll, pitch, roll_rate, pitch_rate, yaw_rate])
 
-    def _scaled_command(self) -> np.ndarray:
-        return self._command / np.asarray(self.curriculum_config.command_limits)
+    def _encoder_measurement(self, qvel: jax.Array) -> jax.Array:
+        return qvel[self._wheel_qvel] / self._max_wheel_speed
 
-    def _max_sensor_latency(self) -> int:
+    def _base_collision(self, data: mjx.Data) -> jax.Array:
+        if not self._base_contacts.any():
+            return jnp.array(False)
+        dist = data._impl.contact.dist[self._base_contacts]
+        return jnp.any(dist < 0)
+
+    # ------------------------------------------------------------------ observation
+
+    def _scaled_command(self, command: jax.Array) -> jax.Array:
+        return command / jnp.asarray(self.curriculum_config.command_limits)
+
+    def _observe(self, data: mjx.Data, info: dict, rng: jax.Array, first: bool) -> tuple[dict, dict]:
+        """Push the current sensor readings into the buffers; return (obs, info)."""
         cfg = self.randomization_config
-        return max(cfg.max_imu_latency_steps, cfg.max_encoder_latency_steps)
-
-    def _privileged_state(self) -> np.ndarray:
-        cfg = self.randomization_config
-        forward, lateral = self._heading_axes()
-        forward_velocity, lateral_velocity, _ = self._body_velocities()
-        return np.concatenate(
-            (
-                self._clean_frame(),
-                [forward_velocity, lateral_velocity],
-                _normalized(self._com_offset, self._max_com_offset),
-                [
-                    _normalized(self._mass_scale - 1.0, cfg.mass_fraction),
-                    _normalized(self._friction_scale - 1.0, cfg.friction_fraction),
-                    _normalized(self._push_force @ forward, cfg.impulse_force_n),
-                    _normalized(self._push_force @ lateral, cfg.impulse_force_n),
-                    _normalized(self._motor_latency, cfg.max_motor_latency_steps),
-                    _normalized(self._imu_latency, cfg.max_imu_latency_steps),
-                    _normalized(self._encoder_latency, cfg.max_encoder_latency_steps),
-                    _normalized(self._ground_normal[:2] @ forward, np.sin(cfg.slope_radians)),
-                    _normalized(self._ground_normal[:2] @ lateral, np.sin(cfg.slope_radians)),
-                ],
-            )
+        rotation = self._rotation(data.qpos)
+        measurement = jnp.concatenate(
+            [self._imu_measurement(rotation, data.qvel), self._encoder_measurement(data.qvel)]
         )
-
-    def _get_obs(self) -> np.ndarray:
-        self._history.appendleft(self._actor_frame())
-        while len(self._history) < self.history_length:
-            self._history.append(self._history[-1])
-        return np.concatenate((*self._history, self._privileged_state()))
-
-    # ------------------------------------------------------------- randomization
-
-    def _sample_command(self, allow_reversal: bool = False) -> None:
-        # Stage 2 favours the newest command band; stage 3 (full range, slopes and pushes)
-        # draws 0 or uniform. Stage 1 limits are 0. Mid-episode, some changes are reversals.
-        cfg = self.curriculum_config
-        linear_limit = self.command_limits[0]
-        if (
-            allow_reversal
-            and linear_limit > 0
-            and self.np_random.uniform() < cfg.reversal_probability
-        ):
-            previous = self._command[0]
-            direction = -np.sign(previous) if previous != 0 else self.np_random.choice((-1, 1))
-            speed = self.np_random.uniform(cfg.reversal_min_fraction, 1.0) * linear_limit
-            self._command[:] = (direction * speed, 0.0)
-            self._episode_reversal = True
+        if first:
+            sensors = jnp.tile(measurement, (self._sensor_buffer_length(), 1))
         else:
-            level = 1 if self._stage == CurriculumStage.DOMAIN_RANDOMIZATION else None
-            self._command[:] = self.wheel_feasible_command(
-                *(
-                    self._sample_level_magnitude(limit, level)
-                    * self.np_random.choice((-1.0, 1.0))
-                    for limit in self.command_limits
-                )
-            )
-        self._command_time_remaining = self.np_random.uniform(
-            *self.curriculum_config.command_resample_seconds
+            sensors = jnp.roll(info["sensor_buffer"], 1, axis=0).at[0].set(measurement)
+        imu = sensors[info["imu_latency"], :5]
+        encoders = sensors[info["encoder_latency"], 5:]
+        angle_key, rate_key, encoder_key = jax.random.split(rng, 3)
+        noise = jnp.concatenate(
+            [
+                cfg.imu_angle_noise_rad * jax.random.normal(angle_key, (2,)),
+                cfg.imu_rate_noise_rad_s * jax.random.normal(rate_key, (3,)),
+                cfg.encoder_velocity_noise_rad_s
+                / self._max_wheel_speed
+                * jax.random.normal(encoder_key, (2,)),
+            ]
         )
-        self._command_age = 0.0
+        noisy = info["stage"] >= CurriculumStage.DOMAIN_RANDOMIZATION
+        measured = jnp.concatenate([imu, encoders]) + jnp.where(noisy, noise, 0.0)
+        scaled_command = self._scaled_command(info["command"])
+        frame = jnp.concatenate([scaled_command, measured, info["previous_action"]])
+        if first:
+            history = jnp.tile(frame, (self.history_length, 1))
+        else:
+            history = jnp.roll(info["history"], 1, axis=0).at[0].set(frame)
 
-    def _sample_randomization(self) -> np.ndarray:
-        """Randomize the model for stage 3 and return the ground orientation quaternion."""
+        forward, lateral = self.heading_axes(rotation)
+        forward_velocity, lateral_velocity, _ = self._body_velocities(rotation, data.qvel)
+        latencies = jnp.stack(
+            [info["motor_latency"], info["imu_latency"], info["encoder_latency"]]
+        ).astype(jnp.float32)
+        max_latencies = np.array(
+            [cfg.max_motor_latency_steps, cfg.max_imu_latency_steps, cfg.max_encoder_latency_steps],
+            dtype=np.float32,
+        )
+        privileged = jnp.concatenate(
+            [
+                scaled_command,
+                measurement,
+                info["previous_action"],
+                jnp.stack([forward_velocity, lateral_velocity]),
+                _normalized(info["com_offset"], cfg.center_of_mass_offset_m),
+                jnp.stack(
+                    [
+                        _normalized(info["mass_scale"] - 1.0, cfg.mass_fraction),
+                        _normalized(info["friction_scale"] - 1.0, cfg.friction_fraction),
+                        _normalized(info["push_force"] @ forward, cfg.impulse_force_n),
+                        _normalized(info["push_force"] @ lateral, cfg.impulse_force_n),
+                    ]
+                ),
+                latencies / np.maximum(max_latencies, 1.0),
+                _normalized(
+                    jnp.stack([info["ground_normal"][:2] @ forward, info["ground_normal"][:2] @ lateral]),
+                    np.sin(cfg.slope_radians),
+                ),
+            ]
+        )
+        info = {**info, "sensor_buffer": sensors, "history": history}
+        obs = {ACTOR_KEY: history.reshape(-1), CRITIC_KEY: privileged}
+        return obs, info
+
+    def _sensor_buffer_length(self) -> int:
         cfg = self.randomization_config
-        randomize = self._stage >= CurriculumStage.DOMAIN_RANDOMIZATION
-        self._mass_scale = (
-            self.np_random.uniform(1.0 - cfg.mass_fraction, 1.0 + cfg.mass_fraction)
-            if randomize
-            else 1.0
+        return max(cfg.max_imu_latency_steps, cfg.max_encoder_latency_steps) + 1
+
+    # ------------------------------------------------------------------ reset
+
+    def initial_persistent(self) -> dict:
+        """Persistent info for the first episode: start stage/level, nothing pinned."""
+        return {
+            "stage": jnp.int32(self.start_stage),
+            "level": jnp.int32(self.start_level),
+            "command_held": jnp.array(False),
+            "command": jnp.zeros(2),
+            "override_slope": jnp.float32(jnp.nan),
+            "override_friction": jnp.float32(jnp.nan),
+            "override_com": jnp.full(3, jnp.nan, dtype=jnp.float32),
+        }
+
+    def reset(self, rng: jax.Array) -> State:
+        return self.reset_episode(rng, self.initial_persistent())
+
+    def reset_episode(self, rng: jax.Array, persistent: dict) -> State:
+        """Start an episode at the stage/level (and with the teleop settings) in `persistent`."""
+        env_cfg = self.environment_config
+        cfg = self.randomization_config
+        keys = jax.random.split(rng, 20)
+        stage, level = persistent["stage"], persistent["level"]
+        randomize = stage >= CurriculumStage.DOMAIN_RANDOMIZATION
+
+        def signed(key, limit):
+            magnitude_key, sign_key = jax.random.split(key)
+            sign = jnp.where(jax.random.bernoulli(sign_key), 1.0, -1.0)
+            return self.sample_level_magnitude(magnitude_key, limit, level) * sign
+
+        # Randomized physics (stage 3); teleop overrides take precedence.
+        mass_scale = jnp.where(
+            randomize,
+            jax.random.uniform(keys[0], minval=1 - cfg.mass_fraction, maxval=1 + cfg.mass_fraction),
+            1.0,
         )
-        self._com_offset = (
-            np.array(
-                [
-                    self._sample_level_magnitude(self.com_offset_limit)
-                    * self.np_random.choice((-1.0, 1.0))
-                    for _ in range(3)
-                ]
+        com_limit = self.com_offset_limit(stage, level)
+        com_offset = jnp.where(
+            randomize, jnp.stack([signed(k, com_limit) for k in jax.random.split(keys[1], 3)]), 0.0
+        )
+        friction_scale = jnp.where(
+            randomize,
+            jax.random.uniform(
+                keys[2], minval=1 - cfg.friction_fraction, maxval=1 + cfg.friction_fraction
+            ),
+            1.0,
+        )
+        latency = [
+            jnp.where(randomize, jax.random.randint(key, (), 0, maximum + 1), 0)
+            for key, maximum in zip(
+                keys[3:6],
+                (
+                    cfg.max_motor_latency_steps,
+                    cfg.max_imu_latency_steps,
+                    cfg.max_encoder_latency_steps,
+                ),
             )
-            if randomize
-            else np.zeros(3)
-        )
-        self._friction_scale = (
-            self.np_random.uniform(1.0 - cfg.friction_fraction, 1.0 + cfg.friction_fraction)
-            if randomize
-            else 1.0
-        )
-        self._motor_latency, self._imu_latency, self._encoder_latency = (
-            (
-                int(self.np_random.integers(0, cfg.max_motor_latency_steps + 1)),
-                int(self.np_random.integers(0, cfg.max_imu_latency_steps + 1)),
-                int(self.np_random.integers(0, cfg.max_encoder_latency_steps + 1)),
-            )
-            if randomize
-            else (0, 0, 0)
-        )
-        self._slope = (
-            self._sample_level_magnitude(self.slope_limit) * self.np_random.choice((-1.0, 1.0))
-            if randomize
-            else 0.0
-        )
-        slope_axis_angle = self.np_random.uniform(-np.pi, np.pi)
+        ]
+        slope = jnp.where(randomize, signed(keys[6], self.slope_limit(stage, level)), 0.0)
+        slope_axis_angle = jax.random.uniform(keys[7], minval=-jnp.pi, maxval=jnp.pi)
 
-        overrides = self._physics_overrides
-        if "slope" in overrides:
-            self._slope, slope_axis_angle = overrides["slope"], 0.0
-        if "friction" in overrides:
-            self._friction_scale = overrides["friction"] / self._nominal_ground_friction
-        if "com_offset" in overrides:
-            self._com_offset = overrides["com_offset"].copy()
-
-        ground_quat = np.zeros(4)
-        mujoco.mju_axisAngle2Quat(
-            ground_quat,
-            np.array([np.cos(slope_axis_angle), np.sin(slope_axis_angle), 0.0]),
-            self._slope,
+        pinned_slope = ~jnp.isnan(persistent["override_slope"])
+        slope = jnp.where(pinned_slope, persistent["override_slope"], slope)
+        slope_axis_angle = jnp.where(pinned_slope, 0.0, slope_axis_angle)
+        friction_scale = jnp.where(
+            jnp.isnan(persistent["override_friction"]),
+            friction_scale,
+            persistent["override_friction"] / self._nominal_ground_friction,
         )
-        self.data.mocap_quat[self._terrain_mocap_id] = ground_quat
-        self._ground_normal = np.zeros(3)
-        mujoco.mju_rotVecQuat(self._ground_normal, np.array([0.0, 0.0, 1.0]), ground_quat)
-        self._apply_physics()
-        return ground_quat
-
-    def _apply_physics(self) -> None:
-        self.model.body_mass[self._base_body_id] = self._nominal_mass * self._mass_scale
-        self.model.body_inertia[self._base_body_id] = self._nominal_inertia * self._mass_scale
-        self.model.body_ipos[self._base_body_id] = self._nominal_com + self._com_offset
-        # MuJoCo uses the larger friction of the two contacting geoms, so scale all of them.
-        self.model.geom_friction[:] = self._nominal_friction
-        self.model.geom_friction[:, 0] *= self._friction_scale
-
-    def reset_model(self) -> np.ndarray:
-        ground_quat = self._sample_randomization()
-        if not self._command_held:
-            self._sample_command()
-        self._episode_step = 0
-        self._episode_tracking[:] = 0.0
-        self._episode_reversal = False
-        self._previous_action[:] = 0.0
-        self._action_queue.clear()
-        self._sensor_buffer.clear()
-        self._history.clear()
-        self._push_force[:] = 0.0
-        self._push_end_time = 0.0
-        self._next_impulse_time = self.np_random.uniform(
-            *self.randomization_config.impulse_interval_seconds
+        com_offset = jnp.where(
+            jnp.isnan(persistent["override_com"]), com_offset, persistent["override_com"]
         )
+
+        ground_quat = axis_angle_quat(
+            jnp.stack([jnp.cos(slope_axis_angle), jnp.sin(slope_axis_angle), 0.0]), slope
+        )
+        ground_normal = rotate(jnp.array([0.0, 0.0, 1.0]), ground_quat)
 
         # Random heading on the (possibly sloped) ground: the axle lies on the slope, the
         # body is turned about the axle so it starts near vertical (initial lean only).
-        yaw_quat, on_slope_quat, pitch_quat, base_quat = (np.zeros(4) for _ in range(4))
-        mujoco.mju_axisAngle2Quat(
-            yaw_quat, np.array([0.0, 0.0, 1.0]), self.np_random.uniform(-np.pi, np.pi)
+        yaw_quat = axis_angle_quat(
+            jnp.array([0.0, 0.0, 1.0]), jax.random.uniform(keys[8], minval=-jnp.pi, maxval=jnp.pi)
         )
-        mujoco.mju_mulQuat(on_slope_quat, ground_quat, yaw_quat)
-        rotation = np.zeros(9)
-        mujoco.mju_quat2Mat(rotation, on_slope_quat)
-        up = rotation.reshape(3, 3)[2]
-        pitch_on_slope = np.arctan2(up[1], up[2])
-        initial_pitch = self.np_random.uniform(
-            -self.environment_config.initial_pitch_radians,
-            self.environment_config.initial_pitch_radians,
+        on_slope_quat = quat_mul(ground_quat, yaw_quat)
+        up = quat_to_mat(on_slope_quat)[2]
+        pitch_on_slope = jnp.arctan2(up[1], up[2])
+        initial_pitch = jax.random.uniform(
+            keys[9], minval=-env_cfg.initial_pitch_radians, maxval=env_cfg.initial_pitch_radians
         )
-        mujoco.mju_axisAngle2Quat(
-            pitch_quat, np.array([1.0, 0.0, 0.0]), initial_pitch - pitch_on_slope
+        pitch_quat = axis_angle_quat(jnp.array([1.0, 0.0, 0.0]), initial_pitch - pitch_on_slope)
+        base_quat = quat_mul(on_slope_quat, pitch_quat)
+        base_position = rotate(
+            jnp.asarray(self._init_qpos[self._base_qpos : self._base_qpos + 3]), ground_quat
         )
-        mujoco.mju_mulQuat(base_quat, on_slope_quat, pitch_quat)
-        base_position = np.zeros(3)
-        mujoco.mju_rotVecQuat(
-            base_position, self.init_qpos[self._base_qpos : self._base_qpos + 3], ground_quat
+        qpos = (
+            jnp.asarray(self._init_qpos)
+            .at[self._base_qpos : self._base_qpos + 3]
+            .set(base_position)
+            .at[self._base_qpos + 3 : self._base_qpos + 7]
+            .set(base_quat)
         )
-        qpos = self.init_qpos.copy()
-        qpos[self._base_qpos : self._base_qpos + 3] = base_position
-        qpos[self._base_qpos + 3 : self._base_qpos + 7] = base_quat
-        noise = self.environment_config.initial_state_noise
-        qvel = self.init_qvel + self.np_random.uniform(-noise, noise, size=self.model.nv)
-        self.set_state(qpos, qvel)
-        return self._get_obs()
+        noise = env_cfg.initial_state_noise
+        qvel = jax.random.uniform(keys[10], (self._mj_model.nv,), minval=-noise, maxval=noise)
+        data = mjx.make_data(self._mjx_model, impl=self._impl).replace(
+            qpos=qpos, qvel=qvel, mocap_quat=ground_quat[None]
+        )
 
-    def _update_disturbance(self) -> None:
-        self.data.xfrc_applied[self._base_body_id] = 0.0
-        if self._stage < CurriculumStage.DOMAIN_RANDOMIZATION:
-            return
+        info = {
+            "rng": keys[11],
+            "stage": stage,
+            "level": level,
+            "episode_stage": stage,
+            "episode_level": level,
+            "command_held": persistent["command_held"],
+            "override_slope": persistent["override_slope"],
+            "override_friction": persistent["override_friction"],
+            "override_com": persistent["override_com"],
+            "command": persistent["command"],
+            "episode_step": jnp.int32(0),
+            "previous_action": jnp.zeros(2),
+            "action_queue": jnp.zeros((cfg.max_motor_latency_steps + 1, 2)),
+            "motor_latency": latency[0],
+            "imu_latency": latency[1],
+            "encoder_latency": latency[2],
+            "mass_scale": mass_scale,
+            "friction_scale": friction_scale,
+            "com_offset": com_offset,
+            "slope": slope,
+            "ground_normal": ground_normal,
+            "push_force": jnp.zeros(2),
+            "push_end_time": jnp.float32(0.0),
+            "next_impulse_time": jax.random.uniform(
+                keys[12],
+                minval=cfg.impulse_interval_seconds[0],
+                maxval=cfg.impulse_interval_seconds[1],
+            ),
+            # Level-up sums: (speed reached along the command, commanded speed, |v| on zero
+            # speed commands, steps on zero speed commands).
+            "episode_tracking": jnp.zeros(4),
+            "episode_reversal": jnp.array(False),
+            "terminated": jnp.array(False),
+            "truncation": jnp.float32(0.0),
+            # Last step's readings (for plots and the teleop panel).
+            "pitch": jnp.float32(0.0),
+            "roll": jnp.float32(0.0),
+            "forward_velocity": jnp.float32(0.0),
+            "yaw_rate": jnp.float32(0.0),
+            "reward_terms": {name: jnp.float32(0.0) for name in REWARD_TERMS},
+        }
+        command, duration, _ = self._sample_command(keys[13], info, allow_reversal=False)
+        info["command"] = jnp.where(persistent["command_held"], persistent["command"], command)
+        info["command_time_remaining"] = duration
+        info["command_age"] = jnp.float32(0.0)
+        info["sensor_buffer"] = jnp.zeros((self._sensor_buffer_length(), 7))
+        info["history"] = jnp.zeros((self.history_length, ACTOR_FRAME_SIZE))
+        obs, info = self._observe(data, info, keys[14], first=True)
+        metrics = {name: jnp.float32(0.0) for name in METRIC_NAMES}
+        return State(data, obs, jnp.float32(0.0), jnp.float32(0.0), metrics, info)
+
+    # ------------------------------------------------------------------ step
+
+    def _update_disturbance(self, info: dict, rng: jax.Array) -> dict:
+        """Random pushes on the base (stage 3), as a force in the world xy-plane."""
         cfg = self.randomization_config
-        time = self._episode_step * self.dt
-        if time >= self._next_impulse_time:
-            direction = self.np_random.uniform(-np.pi, np.pi)
-            magnitude = self._sample_level_magnitude(self.push_limit)
-            self._push_force = magnitude * np.array([np.cos(direction), np.sin(direction)])
-            self._push_end_time = time + cfg.impulse_duration_seconds
-            self._next_impulse_time += self.np_random.uniform(*cfg.impulse_interval_seconds)
-        if time >= self._push_end_time:
-            self._push_force[:] = 0.0
-        self.data.xfrc_applied[self._base_body_id, :2] = self._push_force
+        direction_key, magnitude_key, interval_key = jax.random.split(rng, 3)
+        time = info["episode_step"] * self.dt
+        randomize = info["stage"] >= CurriculumStage.DOMAIN_RANDOMIZATION
+        start = randomize & (time >= info["next_impulse_time"])
+        direction = jax.random.uniform(direction_key, minval=-jnp.pi, maxval=jnp.pi)
+        magnitude = self.sample_level_magnitude(
+            magnitude_key, self.push_limit(info["stage"], info["level"]), info["level"]
+        )
+        push = jnp.where(
+            start, magnitude * jnp.stack([jnp.cos(direction), jnp.sin(direction)]), info["push_force"]
+        )
+        push_end = jnp.where(start, time + cfg.impulse_duration_seconds, info["push_end_time"])
+        next_impulse = info["next_impulse_time"] + jnp.where(
+            start,
+            jax.random.uniform(
+                interval_key,
+                minval=cfg.impulse_interval_seconds[0],
+                maxval=cfg.impulse_interval_seconds[1],
+            ),
+            0.0,
+        )
+        push = jnp.where((time >= push_end) | ~randomize, 0.0, push)
+        return {
+            **info,
+            "push_force": push,
+            "push_end_time": push_end,
+            "next_impulse_time": next_impulse,
+        }
 
-    # --------------------------------------------------------------- episode
-
-    def _base_collision(self) -> bool:
-        for contact in self.data.contact[: self.data.ncon]:
-            geom_pair = {int(contact.geom1), int(contact.geom2)}
-            if geom_pair == {self._ground_geom_id, self._base_geom_id}:
-                return True
-        return False
-
-    def _track_command(self, forward_velocity: float) -> None:
+    def _track_command(self, info: dict, forward_velocity: jax.Array) -> dict:
         """Accumulate the speed-ratio and standing-still sums used to level up."""
         cfg = self.curriculum_config
-        if self._command_age >= cfg.speed_ratio_settle_seconds:
-            linear = self._command[0]
-            if linear == 0.0:
-                self._episode_tracking[2:] += (abs(forward_velocity), 1.0)
-            elif abs(linear) >= max(
-                cfg.speed_ratio_min_fraction * self.command_limits[0], cfg.speed_ratio_min_command
-            ):
-                # Speed along the commanded direction (driving backwards counts against).
-                self._episode_tracking[:2] += (forward_velocity * np.sign(linear), abs(linear))
-        self._command_age += self.dt
-
-    def _advance_curriculum(self, episode_success: bool) -> None:
-        cfg = self.curriculum_config
-        self._stage_results.append(episode_success)
-        self._stage_tracking.append(self._episode_tracking.copy())
-        self._stage_reversals.append((self._episode_reversal, episode_success))
-        self._level_episodes += 1
-        if len(self._stage_results) < cfg.evaluation_window:
-            return
-        success_rate = float(np.mean(self._stage_results))
-        reached, commanded, still_speed, still_steps = np.sum(self._stage_tracking, axis=0)
-        speed_ratio = reached / commanded if commanded > 0 else 1.0
-        mean_still_speed = still_speed / still_steps if still_steps > 0 else 0.0
-        reversal_results = [success for had, success in self._stage_reversals if had]
-        reversal_rate = float(np.mean(reversal_results)) if reversal_results else 1.0
-        if self._stage == CurriculumStage.STABILIZATION:
-            passed = success_rate >= cfg.stage1_timeout_success_rate
-        else:
-            ramp = self._stage == CurriculumStage.COMMAND_RAMP
-            passed = (
-                self._level_episodes
-                >= (
-                    cfg.command_min_episodes_per_level
-                    if ramp
-                    else cfg.randomization_min_episodes_per_level
-                )
-                and success_rate
-                >= (cfg.command_level_success_rate if ramp else cfg.randomization_level_success_rate)
-                and speed_ratio
-                >= (cfg.command_speed_ratio if ramp else cfg.randomization_speed_ratio)
-                and mean_still_speed
-                <= (cfg.command_still_speed_limit if ramp else cfg.randomization_still_speed_limit)
-                and reversal_rate >= cfg.reversal_success_rate
+        linear = info["command"][0]
+        settled = info["command_age"] >= cfg.speed_ratio_settle_seconds
+        still = settled & (linear == 0.0)
+        limit = self.command_limits(info["stage"], info["level"])[0]
+        moving = (
+            settled
+            & (linear != 0.0)
+            & (
+                jnp.abs(linear)
+                >= jnp.maximum(cfg.speed_ratio_min_fraction * limit, cfg.speed_ratio_min_command)
             )
-        if not passed:
-            return
-        if self._difficulty_level < self.max_level:
-            self.set_difficulty_level(self._difficulty_level + 1)
-        elif self._stage < CurriculumStage.DOMAIN_RANDOMIZATION:
-            self.set_curriculum_stage(self._stage + 1)
+        )
+        # Speed along the commanded direction (driving backwards counts against).
+        update = jnp.where(
+            moving,
+            jnp.stack([forward_velocity * jnp.sign(linear), jnp.abs(linear), 0.0, 0.0]),
+            jnp.where(still, jnp.stack([0.0, 0.0, jnp.abs(forward_velocity), 1.0]), 0.0),
+        )
+        return {
+            **info,
+            "episode_tracking": info["episode_tracking"] + update,
+            "command_age": info["command_age"] + self.dt,
+        }
 
-    def step(self, action: np.ndarray):
-        action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
-        self._action_queue.append(action)
-        while len(self._action_queue) <= self._motor_latency:
-            self._action_queue.appendleft(np.zeros(2))
-        applied_action = self._action_queue.popleft()
-        self._update_disturbance()
-        self.do_simulation(applied_action * self._max_wheel_speed, self.frame_skip)
-        self._episode_step += 1
+    def step(self, state: State, action: jax.Array) -> State:
+        info = dict(state.info)
+        rng, push_key, command_key, noise_key = jax.random.split(info["rng"], 4)
+        info["rng"] = rng
 
-        roll, pitch = self._tilt()
-        pitch_rate = float(self.data.qvel[self._base_qvel + 3])
-        forward_velocity, _, yaw_rate = self._body_velocities()
-        linear_error = forward_velocity - self._command[0]
-        angular_error = yaw_rate - self._command[1]
-        self._track_command(forward_velocity)
+        action = jnp.clip(action, -1.0, 1.0)
+        queue = jnp.roll(info["action_queue"], 1, axis=0).at[0].set(action)
+        applied_action = queue[info["motor_latency"]]
+        info["action_queue"] = queue
+
+        info = self._update_disturbance(info, push_key)
+        xfrc = jnp.zeros((self._mj_model.nbody, 6)).at[self._base_body_id, :2].set(info["push_force"])
+        data = state.data.replace(xfrc_applied=xfrc)
+        data = mjx_env.step(
+            self._episode_model(info), data, applied_action * self._max_wheel_speed, self.n_substeps
+        )
+        info["episode_step"] = info["episode_step"] + 1
+
+        rotation = self._rotation(data.qpos)
+        roll, pitch = tilt(rotation)
+        pitch_rate = data.qvel[self._base_qvel + 3]
+        forward_velocity, _, yaw_rate = self._body_velocities(rotation, data.qvel)
+        linear_error = forward_velocity - info["command"][0]
+        angular_error = yaw_rate - info["command"][1]
+        info = self._track_command(info, forward_velocity)
 
         # Rewards use the command the policy was conditioned on and its own action
         # (a_t, a_{t-1}), which is also what the ESP32 feeds back as the previous action.
@@ -721,16 +784,17 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
                 cfg.linear_velocity_wide_variance,
                 cfg.linear_velocity_wide_fraction,
             ),
-            "angular_velocity": np.exp(-(angular_error**2) / cfg.angular_velocity_variance),
-            "action": -float(np.square(action).sum()),
-            "smoothness": -float(np.square(action - self._previous_action).sum()),
+            "angular_velocity": jnp.exp(-(angular_error**2) / cfg.angular_velocity_variance),
+            "action": -jnp.sum(jnp.square(action)),
+            "smoothness": -jnp.sum(jnp.square(action - info["previous_action"])),
         }
-        self._previous_action = action.copy()
+        info["previous_action"] = action
 
-        pitch_failure = max(abs(pitch), abs(roll)) > self.environment_config.upright_limit_radians
-        base_collision = self._base_collision()
-        terminated = bool(pitch_failure or base_collision)
-        truncated = self._episode_step >= self.max_episode_steps
+        env_cfg = self.environment_config
+        pitch_failure = jnp.maximum(jnp.abs(pitch), jnp.abs(roll)) > env_cfg.upright_limit_radians
+        spinning = jnp.abs(yaw_rate) > env_cfg.yaw_rate_limit_rad_s
+        terminated = pitch_failure | spinning | self._base_collision(data)
+        truncated = info["episode_step"] >= self.max_episode_steps
         reward = (
             cfg.alive_weight * reward_terms["alive"]
             + cfg.pitch_rate_weight * reward_terms["pitch_rate"]
@@ -739,34 +803,37 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
             + cfg.action_weight * reward_terms["action"]
             + cfg.smoothness_weight * reward_terms["smoothness"]
         )
-        if terminated:
-            reward = 0.0
-        info = {
-            "pitch": pitch,
-            "pitch_rate": pitch_rate,
-            "roll": roll,
-            "forward_velocity": forward_velocity,
-            "yaw_rate": yaw_rate,
-            "v_cmd": float(self._command[0]),
-            "omega_cmd": float(self._command[1]),
-            "curriculum_stage": int(self._stage),
-            "curriculum_level": self._difficulty_level,
-            "episode_step": self._episode_step,
-            "terminated_reason": (
-                "pitch_failure"
-                if pitch_failure
-                else "base_collision"
-                if base_collision
-                else "timeout"
-                if truncated
-                else None
-            ),
-        }
-        info.update({f"reward_{name}": float(value) for name, value in reward_terms.items()})
-        if terminated or truncated:
-            self._advance_curriculum(not terminated)
+        reward = jnp.where(terminated, 0.0, reward)
+        done = terminated | truncated
+        info["terminated"] = terminated
+        info["truncation"] = (truncated & ~terminated).astype(jnp.float32)
+        info["pitch"] = pitch
+        info["roll"] = roll
+        info["forward_velocity"] = forward_velocity
+        info["yaw_rate"] = yaw_rate
+        info["reward_terms"] = {name: jnp.asarray(value, jnp.float32) for name, value in reward_terms.items()}
 
-        self._command_time_remaining -= self.dt
-        if self._command_time_remaining <= 0 and not self._command_held:
-            self._sample_command(allow_reversal=True)
-        return self._get_obs(), float(reward), terminated, truncated, info
+        # Mid-episode command changes (a reversal on the final step does not count for it).
+        remaining = info["command_time_remaining"] - self.dt
+        command, duration, reversal = self._sample_command(command_key, info, allow_reversal=True)
+        resample = (remaining <= 0) & ~info["command_held"]
+        info["command"] = jnp.where(resample, command, info["command"])
+        info["command_time_remaining"] = jnp.where(resample, duration, remaining)
+        info["command_age"] = jnp.where(resample, 0.0, info["command_age"])
+        info["episode_reversal"] = info["episode_reversal"] | (resample & reversal & ~done)
+
+        obs, info = self._observe(data, info, noise_key, first=False)
+        metrics = {
+            "linear_error": jnp.abs(linear_error),
+            "angular_error": jnp.abs(angular_error),
+            "abs_pitch_deg": jnp.degrees(jnp.abs(pitch)),
+            "survived": info["truncation"],
+        }
+        return state.replace(
+            data=data,
+            obs=obs,
+            reward=reward,
+            done=done.astype(jnp.float32),
+            metrics=metrics,
+            info=info,
+        )

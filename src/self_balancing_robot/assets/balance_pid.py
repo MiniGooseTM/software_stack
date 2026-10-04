@@ -1,4 +1,4 @@
-"""Quick PID balancing controller for XML-test.xml.
+"""Quick PID balancing controller for env_v0.xml (goose.xml on flat ground).
 
 Uses only sensors the real robot has (IMU accel + gyro, wheel encoders):
 pitch is estimated with a complementary filter, not read from the sim state.
@@ -22,7 +22,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-XML_PATH = Path(__file__).parent / "XML-test.xml"
+XML_PATH = Path(__file__).parent / "env_v0.xml"
 
 # Initial tilt so the controller has something to do [rad]
 INITIAL_PITCH = 0.1
