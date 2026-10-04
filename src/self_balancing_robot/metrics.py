@@ -62,21 +62,17 @@ def run_episodes(
     actor: Actor,
     seeds: list[int],
     max_steps: int | None = None,
-    stage: int | None = None,
-    level: int | None = None,
+    stage: int | str | None = None,
     record_states: bool = False,
 ) -> list[dict]:
     """Run deterministic episodes in parallel (one per seed) and return their time series.
 
-    ``stage``/``level`` default to the env's start stage and level.
+    ``stage`` (index or name) defaults to the env's start stage.
     """
     steps = max_steps or env.max_episode_steps
     persistent = env.initial_persistent()
     if stage is not None:
-        persistent["stage"] = jnp.int32(stage)
-        persistent["level"] = jnp.int32(env.max_level(stage) if level is None else level)
-    elif level is not None:
-        persistent["level"] = jnp.int32(level)
+        persistent["stage"] = jnp.int32(env.stage_index(stage))
     keys = jnp.stack([jax.random.PRNGKey(seed) for seed in seeds])
     layers = [(jnp.asarray(w), jnp.asarray(b)) for w, b in actor.layers]
     batch = jax.device_get(_rollout_fn(env, steps, record_states)(layers, keys, persistent))
@@ -89,7 +85,7 @@ def run_episodes(
         result = {key: value[:length] for key, value in trace.items()}
         result["time"] = np.arange(1, length + 1) * env.dt
         result["stage"] = int(persistent["stage"])
-        result["level"] = int(persistent["level"])
+        result["stage_name"] = env.curriculum[result["stage"]].name
         result["end"] = "fall" if terminated else "timeout" if truncated else "max_steps"
         result["survived"] = not terminated
         result["upright_limit"] = env.environment_config.upright_limit_radians
@@ -169,7 +165,7 @@ def plot_episode(trace: dict, output_path: Path, title: str = "") -> None:
         axis.legend(loc="upper right", fontsize="small")
     metrics = summarize(trace)
     figure.suptitle(
-        f"{title} stage {trace['stage']} level {trace['level']}, ended by {trace['end']} after {time[-1]:.1f} s\n"
+        f"{title} stage {trace['stage']} \"{trace['stage_name']}\", ended by {trace['end']} after {time[-1]:.1f} s\n"
         f"mean |v error| {metrics['linear_error']:.3f} m/s, "
         f"mean |yaw error| {metrics['angular_error']:.3f} rad/s, "
         f"mean |pitch| {metrics['abs_pitch_deg']:.1f} deg"
@@ -179,9 +175,11 @@ def plot_episode(trace: dict, output_path: Path, title: str = "") -> None:
     plt.close(figure)
 
 
-def plot_training_metrics(history: dict[str, list], output_path: Path) -> None:
+def plot_training_metrics(
+    history: dict[str, list], output_path: Path, stage_names: list[str] | None = None
+) -> None:
     """Six-panel training dashboard over timesteps: deterministic episodes at the current
-    curriculum level and at the final difficulty (stage 3, last level)."""
+    curriculum stage and at the last stage, and the curriculum stage."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     panels = (
         ("reward", "Episode reward"),
@@ -194,7 +192,7 @@ def plot_training_metrics(history: dict[str, list], output_path: Path) -> None:
     figure, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
     for axis, (key, label) in zip(axes.flat, panels):
         scale = 100.0 if key == "survival" else 1.0
-        for prefix, name in (("level_", "Current level"), ("final_", "Final difficulty")):
+        for prefix, name in (("stage_", "Current stage"), ("final_", "Last stage")):
             values = history.get(prefix + key, [])
             if len(values) == len(steps) and len(steps):
                 axis.plot(steps, np.asarray(values, dtype=float) * scale, label=name)
@@ -202,15 +200,13 @@ def plot_training_metrics(history: dict[str, list], output_path: Path) -> None:
         if key == "survival":
             axis.set_ylim(0, 105)
     stage_axis = axes.flat[-1]
-    if history.get("curriculum_progress"):
-        stage_axis.step(steps, history["curriculum_progress"], where="post", label="stage + level fraction")
-    stage_axis.set_title("Curriculum: stage + fraction of its levels passed")
-    stage_axis.set_yticks([1, 2, 3])
-    stage_changes = [
-        steps[i]
-        for i in range(1, len(history.get("curriculum_progress", [])))
-        if int(history["curriculum_progress"][i]) != int(history["curriculum_progress"][i - 1])
-    ]
+    stages = history.get("stage", [])
+    if stages:
+        stage_axis.step(steps, stages, where="post")
+    stage_axis.set_title("Curriculum stage")
+    if stage_names:
+        stage_axis.set_yticks(range(len(stage_names)), stage_names, fontsize="small")
+    stage_changes = [steps[i] for i in range(1, len(stages)) if stages[i] != stages[i - 1]]
     for axis in axes.flat:
         for step in stage_changes:
             axis.axvline(step, color="grey", ls=":", lw=1)

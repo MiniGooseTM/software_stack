@@ -5,6 +5,7 @@ import numpy as np
 
 from self_balancing_robot.actor import Actor, resolve_model
 from self_balancing_robot.config import DEFAULT_TRAINING_CONFIG
+from self_balancing_robot.curriculum import CURRICULUM
 from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
 from self_balancing_robot.metrics import (
     METRIC_KEYS,
@@ -28,11 +29,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--stage",
-        type=int,
-        default=1,
-        choices=range(1, 4),
-        help="Curriculum stage to run at its last level: 1 = balance, 2 = full commands, "
-        "3 = full commands with slopes, pushes, noise and latency.",
+        default="-1",
+        help="Curriculum stage to run, by name or index (default -1, the last). Stages: "
+        + ", ".join(f'{i} "{s.name}"' for i, s in enumerate(CURRICULUM)),
     )
     parser.add_argument("--seed", type=int, default=0, help="Seed of the first episode.")
     parser.add_argument(
@@ -52,15 +51,19 @@ def main() -> None:
     model = resolve_model(args.model)
     actor = Actor.load(model)
     env = SelfBalancingRobotEnv()
-    # All episodes run in parallel, at the last level of the stage.
+    try:
+        stage = env.stage_index(args.stage)
+    except ValueError as error:
+        parser.error(str(error))
+    # All episodes run in parallel.
     traces = run_episodes(
         env,
         actor,
         [args.seed + episode for episode in range(args.episodes)],
-        stage=args.stage,
+        stage=stage,
         record_states=args.video is not None,
     )
-    print(f"Evaluating {model} at stage {args.stage} level {traces[0]['level']}")
+    print(f'Evaluating {model} at stage {stage} "{traces[0]["stage_name"]}"')
     summaries = []
     for episode, trace in enumerate(traces):
         summary = summarize(trace)
@@ -75,7 +78,7 @@ def main() -> None:
         if args.plot_dir is not None:
             plot_episode(
                 trace,
-                args.plot_dir / f"episode_{episode + 1:02d}_stage{args.stage}.png",
+                args.plot_dir / f"episode_{episode + 1:02d}_stage{stage}.png",
                 f"Episode {episode + 1},",
             )
     print(

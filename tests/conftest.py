@@ -29,15 +29,16 @@ def _jitted(env: SelfBalancingRobotEnv):
     return jax.jit(env.reset_episode), jax.jit(env.step)
 
 
-def persistent(env: SelfBalancingRobotEnv, stage: int = 1, level: int = 1, **values) -> dict:
-    result = {**env.initial_persistent(), "stage": jnp.int32(stage), "level": jnp.int32(level)}
+def persistent(env: SelfBalancingRobotEnv, stage: int | str = 0, **values) -> dict:
+    """Persistent info for an episode at `stage` (index or name) with some values set."""
+    result = {**env.initial_persistent(), "stage": jnp.int32(env.stage_index(stage))}
     for name, value in values.items():
         result[name] = jnp.asarray(value, dtype=result[name].dtype)
     return result
 
 
-def reset(env: SelfBalancingRobotEnv, seed: int = 0, stage: int = 1, level: int = 1, **values):
-    return _jitted(env)[0](jax.random.PRNGKey(seed), persistent(env, stage, level, **values))
+def reset(env: SelfBalancingRobotEnv, seed: int = 0, stage: int | str = 0, **values):
+    return _jitted(env)[0](jax.random.PRNGKey(seed), persistent(env, stage, **values))
 
 
 def step(env: SelfBalancingRobotEnv, state, action=(0.0, 0.0)):

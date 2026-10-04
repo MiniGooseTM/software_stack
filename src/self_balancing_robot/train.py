@@ -1,7 +1,7 @@
 """Train the balancing policy with Brax PPO on the GPU (thousands of MJX environments).
 
 Everything a run produces goes into its run directory (default ``models/runs/<time>``):
-``params.pkl`` (latest checkpoint), ``curriculum.json`` (stage, level, steps; read by
+``params.pkl`` (latest checkpoint), ``curriculum.json`` (stage index and name, steps; read by
 ``--resume``), ``config.json``, ``plots/`` and ``videos/``. TensorBoard logs go to
 ``logs/<run name>``.
 """
@@ -33,7 +33,8 @@ from self_balancing_robot.actor import (
     network_factory,
     save_params,
 )
-from self_balancing_robot.config import DEFAULT_TRAINING_CONFIG, CurriculumStage, TrainingConfig
+from self_balancing_robot.config import DEFAULT_TRAINING_CONFIG, TrainingConfig
+from self_balancing_robot.curriculum import CURRICULUM, stage_index
 from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
 from self_balancing_robot.envs.wrappers import wrap_for_training
 from self_balancing_robot.metrics import (
@@ -67,27 +68,33 @@ class TrainingMonitor:
         self.video_frequency = video_frequency
         self.steps_offset = steps_offset
         self.stage = env.start_stage
-        self.level = env.start_level
         self.history: dict[str, list] = defaultdict(list)
         self.next_video = steps_offset + video_frequency
         self.started = time.time()
 
-    @property
-    def progress(self) -> float:
-        """Stage plus the fraction of its levels passed, e.g. 2.5 = halfway through stage 2."""
-        return self.stage + (self.level - 1) / self.env.max_level(self.stage)
+    def describe(self, stage: int | None = None) -> str:
+        stage = self.stage if stage is None else stage
+        return f'stage {stage} "{self.env.curriculum[stage].name}"'
+
+    def curriculum_state(self, steps: int) -> dict:
+        """What `curriculum.json` stores (and `--resume` reads)."""
+        return {
+            "stage": self.stage,
+            "stage_name": self.env.curriculum[self.stage].name,
+            "steps": steps,
+        }
 
     def curriculum_window(self, stats: dict) -> None:
         """Called from the GPU each time a curriculum window of episodes is evaluated."""
-        if (stats["new_stage"], stats["new_level"]) != (stats["stage"], stats["level"]):
+        stage, new_stage = int(stats["stage"]), int(stats["new_stage"])
+        if new_stage != stage:
             print(
-                f"Curriculum: stage {stats['stage']} level {stats['level']} -> stage "
-                f"{stats['new_stage']} level {stats['new_level']} (survival "
+                f"Curriculum: {self.describe(stage)} -> {self.describe(new_stage)} (survival "
                 f"{stats['success_rate']:.0%}, speed ratio {stats['speed_ratio']:.2f}, "
                 f"still {stats['still_speed']:.3f} m/s, reversals {stats['reversal_rate']:.0%})",
                 flush=True,
             )
-        self.stage, self.level = int(stats["new_stage"]), int(stats["new_level"])
+        self.stage = new_stage
         self.history["windows"].append(stats)
 
     def training_metrics(self, step: int, metrics: dict) -> None:
@@ -105,37 +112,35 @@ class TrainingMonitor:
         """Brax `policy_params_fn`: save, evaluate, plot and (sometimes) record a video."""
         jax.effects_barrier()  # curriculum callbacks of the last training epoch
         total = self.steps_offset + step
-        save_params(
-            self.run_dir, params, {"stage": self.stage, "level": self.level, "steps": total}
-        )
+        save_params(self.run_dir, params, self.curriculum_state(total))
         actor = Actor(layers_from_brax(params[1]))
-        final_stage = int(CurriculumStage.DOMAIN_RANDOMIZATION)
-        current = run_episodes(
-            self.env, actor, self.seeds, self.cfg.evaluation_max_steps, self.stage, self.level
-        )
-        final = run_episodes(self.env, actor, self.seeds, self.cfg.evaluation_max_steps, final_stage)
+        steps = self.cfg.evaluation_max_steps
+        current = run_episodes(self.env, actor, self.seeds, steps, self.stage)
+        final = run_episodes(self.env, actor, self.seeds, steps, self.env.num_stages - 1)
         self.history["steps"].append(total)
-        self.history["curriculum_progress"].append(self.progress)
+        self.history["stage"].append(self.stage)
         self.writer.add_scalar("curriculum/stage", self.stage, total)
-        self.writer.add_scalar("curriculum/level", self.level, total)
-        self.writer.add_scalar("curriculum/progress", self.progress, total)
-        for prefix, traces in (("level", current), ("final", final)):
+        for prefix, traces in (("stage", current), ("final", final)):
             summaries = [summarize(trace) for trace in traces]
             for key in METRIC_KEYS:
                 value = float(np.mean([summary[key] for summary in summaries]))
                 self.history[f"{prefix}_{key}"].append(value)
                 self.writer.add_scalar(f"eval_{prefix}/{key}", value, total)
-        plot_training_metrics(self.history, self.run_dir / "plots" / "training_metrics.png")
+        plot_training_metrics(
+            self.history,
+            self.run_dir / "plots" / "training_metrics.png",
+            [stage.name for stage in self.env.curriculum],
+        )
         plot_episode(
             current[0], self.run_dir / "plots" / "eval_episode_latest.png", f"After {total:,} steps,"
         )
         hours = (time.time() - self.started) / 3600
         print(
-            f"{total:>13,} steps  stage {self.stage} level {self.level}  "
-            f"survival {self.history['level_survival'][-1]:.0%} (final difficulty "
+            f"{total:>13,} steps  {self.describe()}  "
+            f"survival {self.history['stage_survival'][-1]:.0%} (last stage "
             f"{self.history['final_survival'][-1]:.0%})  reward "
-            f"{self.history['level_reward'][-1]:.0f}  |v err| "
-            f"{self.history['level_linear_error'][-1]:.3f} m/s  [{hours:.2f} h]",
+            f"{self.history['stage_reward'][-1]:.0f}  |v err| "
+            f"{self.history['stage_linear_error'][-1]:.3f} m/s  [{hours:.2f} h]",
             flush=True,
         )
         if total >= self.next_video:
@@ -152,7 +157,6 @@ class TrainingMonitor:
                 self.seeds[:1],
                 self.cfg.evaluation_max_steps,
                 self.stage,
-                self.level,
                 record_states=True,
             )[0]
             frames = render_trace(self.env, trace)
@@ -160,7 +164,7 @@ class TrainingMonitor:
         except Exception as error:  # noqa: BLE001
             print(f"Skipping video ({type(error).__name__}: {error})", flush=True)
             return
-        path = self.run_dir / "videos" / f"{name}_stage{self.stage}_level{self.level}.mp4"
+        path = self.run_dir / "videos" / f"{name}_stage{self.stage}.mp4"
         path.parent.mkdir(parents=True, exist_ok=True)
         with warnings.catch_warnings():
             # imageio starts ffmpeg with fork+exec, which JAX warns about but is safe.
@@ -179,6 +183,21 @@ def _jsonable(value):
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def resumed_stage(resumed: dict) -> int:
+    """Stage index to continue from: by name, so inserting stages before it is fine."""
+    name = resumed.get("stage_name")
+    names = [stage.name for stage in CURRICULUM]
+    if name in names:
+        return names.index(name)
+    index = min(int(resumed.get("stage", 0)), len(CURRICULUM) - 1)
+    print(
+        f'Warning: the resumed run\'s stage {name!r} is not in the curriculum; continuing at '
+        f'stage {index} "{CURRICULUM[index].name}" by index.',
+        flush=True,
+    )
+    return index
 
 
 def main() -> None:
@@ -201,36 +220,29 @@ def main() -> None:
         "--resume",
         type=Path,
         default=None,
-        help="Continue from this run directory: its weights and curriculum stage and level.",
+        help="Continue from this run directory: its weights and curriculum stage.",
     )
     parser.add_argument(
         "--start-stage",
-        type=int,
         default=None,
-        choices=range(1, 4),
-        help="Curriculum stage to start in (default 1, or the resumed run's). "
-        "1 = balance, 2 = command ramp, 3 = slopes and pushes.",
-    )
-    parser.add_argument(
-        "--start-level",
-        type=int,
-        default=None,
-        help="Level within the start stage (default 1, or the resumed run's).",
+        help="Curriculum stage to start in, by name or index (default the first, or the "
+        "resumed run's). Stages: " + ", ".join(f'{i} "{s.name}"' for i, s in enumerate(CURRICULUM)),
     )
     args = parser.parse_args()
     if args.num_envs % cfg.num_minibatches:
         parser.error(f"--num-envs must be a multiple of {cfg.num_minibatches} (minibatches)")
 
-    restore_params, steps_offset, stage, level = None, 0, 1, 1
+    restore_params, steps_offset, stage = None, 0, 0
     if args.resume is not None:
         restore_params = load_params(args.resume)
         resumed = load_curriculum(args.resume)
         steps_offset = int(resumed.get("steps", 0))
-        stage, level = int(resumed.get("stage", 1)), int(resumed.get("level", 1))
+        stage = resumed_stage(resumed)
     if args.start_stage is not None:
-        stage, level = args.start_stage, 1
-    if args.start_level is not None:
-        level = args.start_level
+        try:
+            stage = stage_index(CURRICULUM, args.start_stage)
+        except ValueError as error:
+            parser.error(str(error))
 
     run_dir = args.run_dir or cfg.run_dir / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -239,6 +251,7 @@ def main() -> None:
             {
                 "args": _jsonable(vars(args)),
                 "resumed_from": str(args.resume) if args.resume else None,
+                "curriculum": _jsonable(list(CURRICULUM)),
                 **{
                     name: _jsonable(getattr(config_module, name))
                     for name in dir(config_module)
@@ -250,14 +263,14 @@ def main() -> None:
         + "\n"
     )
 
-    env = SelfBalancingRobotEnv(curriculum_stage=stage, difficulty_level=level)
+    env = SelfBalancingRobotEnv(start_stage=stage)
     writer = SummaryWriter(str(cfg.log_dir / run_dir.name))
     monitor = TrainingMonitor(
         run_dir, env, writer, cfg, args.seed, args.video_freq, steps_offset=steps_offset
     )
     print(
         f"Training in {run_dir} on {jax.devices()[0].device_kind}: {args.num_envs} environments, "
-        f"{args.timesteps:,} steps from stage {env.start_stage} level {env.start_level}"
+        f"{args.timesteps:,} steps from {monitor.describe()}"
         + (f", resuming {args.resume} at {steps_offset:,} steps" if args.resume else ""),
         flush=True,
     )
@@ -295,16 +308,14 @@ def main() -> None:
     )
     total = steps_offset + args.timesteps
     jax.effects_barrier()
-    save_params(run_dir, params, {"stage": monitor.stage, "level": monitor.level, "steps": total})
+    save_params(run_dir, params, monitor.curriculum_state(total))
     actor = Actor(layers_from_brax(params[1]))
-    trace = run_episodes(
-        env, actor, monitor.seeds[:1], cfg.evaluation_max_steps, monitor.stage, monitor.level
-    )[0]
+    trace = run_episodes(env, actor, monitor.seeds[:1], cfg.evaluation_max_steps, monitor.stage)[0]
     plot_episode(trace, run_dir / "plots" / "eval_episode_final.png", "Final policy,")
     monitor.record_video(actor, "final")
     writer.close()
     print(
-        f"Saved {run_dir} (stage {monitor.stage} level {monitor.level}, {total:,} steps). "
+        f"Saved {run_dir} ({monitor.describe()}, {total:,} steps). "
         f"Continue with --resume {run_dir}",
         flush=True,
     )

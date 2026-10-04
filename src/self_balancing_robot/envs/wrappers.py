@@ -5,12 +5,13 @@ replaces Brax's Vmap/Episode/AutoReset stack:
 
 - finished environments start a *fresh* episode (`env.reset_episode`) instead of
   Brax's cached first state, so every episode draws its own slope, heading, physics and
-  command at the current curriculum level;
-- the curriculum is global. Episodes that finish at the current stage and level are pooled
-  across all environments in windows of `CurriculumConfig.evaluation_window` episodes and
-  checked with the same rules as before (survival, speed ratio, standing still, reversals,
-  minimum episodes per level). New episodes start at the new level; running ones finish at
-  the level they started with (and are not counted).
+  command at the current curriculum stage;
+- the curriculum is global. Episodes that finish at the current stage are pooled across all
+  environments in windows of `curriculum.EVALUATION_WINDOW` episodes, and each full window
+  is checked against the stage's test (survival, speed ratio, standing still, reversals,
+  minimum episodes; see `curriculum.Stage`). When it passes, new episodes start at the next
+  stage of the list; running ones finish at the stage they started with (and are not
+  counted).
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 from mujoco_playground._src import wrapper as playground_wrapper
 
-from self_balancing_robot.config import CurriculumStage
+from self_balancing_robot.curriculum import EVALUATION_WINDOW
 from self_balancing_robot.envs.balance_env import (
     PERSISTENT_KEYS,
     SelfBalancingRobotEnv,
@@ -35,8 +36,7 @@ CurriculumCallback = Callable[[dict], None]
 def initial_curriculum(env: SelfBalancingRobotEnv) -> dict:
     return {
         "stage": jnp.int32(env.start_stage),
-        "level": jnp.int32(env.start_level),
-        "level_episodes": jnp.int32(0),
+        "stage_episodes": jnp.int32(0),
         "window_episodes": jnp.int32(0),
         "window_successes": jnp.int32(0),
         # Sums of `episode_tracking`: speed reached, speed commanded, |v| standing, steps standing.
@@ -70,10 +70,10 @@ def update_curriculum(
     done: jax.Array,
     callback: CurriculumCallback | None = None,
 ) -> dict:
-    """Add the episodes that just finished (batched `info`, `done`) and level up if earned."""
-    cfg = env.curriculum_config
-    stage, level = curriculum["stage"], curriculum["level"]
-    counted = done & (info["episode_stage"] == stage) & (info["episode_level"] == level)
+    """Add the episodes that just finished (batched `info`, `done`); move to the next stage
+    when a full window passes the current stage's test."""
+    stage = curriculum["stage"]
+    counted = done & (info["episode_stage"] == stage)
     success = counted & ~info["terminated"]
     reversal = counted & info["episode_reversal"]
     window = {
@@ -85,58 +85,27 @@ def update_curriculum(
         "window_reversal_successes": curriculum["window_reversal_successes"]
         + (reversal & success).sum(dtype=jnp.int32),
     }
-    level_episodes = curriculum["level_episodes"] + counted.sum(dtype=jnp.int32)
+    stage_episodes = curriculum["stage_episodes"] + counted.sum(dtype=jnp.int32)
     stats = window_statistics(window)
-    window_full = window["window_episodes"] >= cfg.evaluation_window
+    window_full = window["window_episodes"] >= EVALUATION_WINDOW
 
-    ramp = stage == CurriculumStage.COMMAND_RAMP
-    passed_stage_one = stats["success_rate"] >= cfg.stage1_timeout_success_rate
-    passed_levels = (
-        (
-            level_episodes
-            >= jnp.where(
-                ramp, cfg.command_min_episodes_per_level, cfg.randomization_min_episodes_per_level
-            )
-        )
-        & (
-            stats["success_rate"]
-            >= jnp.where(
-                ramp, cfg.command_level_success_rate, cfg.randomization_level_success_rate
-            )
-        )
-        & (
-            stats["speed_ratio"]
-            >= jnp.where(ramp, cfg.command_speed_ratio, cfg.randomization_speed_ratio)
-        )
-        & (
-            stats["still_speed"]
-            <= jnp.where(ramp, cfg.command_still_speed_limit, cfg.randomization_still_speed_limit)
-        )
-        & (stats["reversal_rate"] >= cfg.reversal_success_rate)
+    # The stage's test; unchecked criteria (None in the Stage) always pass.
+    test = env.stage_params(stage)
+    passed = (
+        window_full
+        & (stage_episodes >= test["min_episodes"])
+        & (stats["success_rate"] >= test["success_rate"])
+        & (stats["speed_ratio"] >= test["speed_ratio"])
+        & (stats["still_speed"] <= test["still_speed_limit"])
+        & (stats["reversal_rate"] >= test["reversal_success_rate"])
     )
-    passed = window_full & jnp.where(
-        stage == CurriculumStage.STABILIZATION, passed_stage_one, passed_levels
-    )
-    last_level = level >= env.max_level(stage)
-    last_stage = stage >= CurriculumStage.DOMAIN_RANDOMIZATION
-    new_stage = jnp.where(passed & last_level & ~last_stage, stage + 1, stage)
-    new_level = jnp.where(
-        passed, jnp.where(last_level, jnp.where(last_stage, level, 1), level + 1), level
-    )
-    changed = (new_stage != stage) | (new_level != level)
+    # The last stage is never left.
+    new_stage = jnp.where(passed & (stage < env.num_stages - 1), stage + 1, stage)
 
     if callback is not None:
 
         def report(*values):
-            names = (
-                "stage",
-                "level",
-                "new_stage",
-                "new_level",
-                "level_episodes",
-                "window_episodes",
-                *stats,
-            )
+            names = ("stage", "new_stage", "stage_episodes", "window_episodes", *stats)
             callback({name: np.asarray(value).item() for name, value in zip(names, values)})
 
         jax.lax.cond(
@@ -144,10 +113,8 @@ def update_curriculum(
             lambda: jax.debug.callback(
                 report,
                 stage,
-                level,
                 new_stage,
-                new_level,
-                level_episodes,
+                stage_episodes,
                 window["window_episodes"],
                 *stats.values(),
             ),
@@ -159,8 +126,7 @@ def update_curriculum(
     window = {key: jnp.where(window_full, empty[key], value) for key, value in window.items()}
     return {
         "stage": new_stage,
-        "level": new_level,
-        "level_episodes": jnp.where(changed, 0, level_episodes),
+        "stage_episodes": jnp.where(new_stage != stage, 0, stage_episodes),
         **window,
     }
 
@@ -219,7 +185,6 @@ class TrainingWrapper(playground_wrapper.Wrapper):
         persistent = {key: step_info[key] for key in PERSISTENT_KEYS}
         if self._curriculum:
             persistent["stage"] = jnp.broadcast_to(curriculum["stage"], done.shape)
-            persistent["level"] = jnp.broadcast_to(curriculum["level"], done.shape)
         fresh = jax.vmap(env.reset_episode)(keys[:, 1], persistent)
 
         def where_done(reset_value, value):

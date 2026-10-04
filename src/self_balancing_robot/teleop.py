@@ -19,7 +19,7 @@ import numpy as np
 from gymnasium.envs.mujoco.mujoco_rendering import MujocoRenderer
 
 from self_balancing_robot.actor import Actor, resolve_model
-from self_balancing_robot.config import DEFAULT_CURRICULUM_CONFIG, DEFAULT_RANDOMIZATION_CONFIG
+from self_balancing_robot.curriculum import CURRICULUM, FULL_COMMAND
 from self_balancing_robot.envs.balance_env import ACTOR_KEY, SelfBalancingRobotEnv
 
 # One environment: CPU JAX has less per-step overhead than a GPU (override with JAX_PLATFORMS).
@@ -37,15 +37,21 @@ CAMERA_VIEWS = (
     ("side", 90.0, -5.0, 0.8),
     ("free (mouse)", None, -25.0, 1.0),
 )
-_COM_RANGE_MM = DEFAULT_RANDOMIZATION_CONFIG.center_of_mass_offset_m * 1000
+# Training ranges shown when typing in physics values: those of the last stage.
+_LAST_STAGE = CURRICULUM[-1]
+_COM_RANGE_MM = _LAST_STAGE.com_offset_max * 1000
 # Physics parameters that can be typed in: key -> (label, unit shown, training range).
 PHYSICS_KEYS = {
     glfw.KEY_G: (
         "slope",
         "rad",
-        f"training range +-{DEFAULT_RANDOMIZATION_CONFIG.slope_radians:g}",
+        f"training range +-{_LAST_STAGE.slope_max:g}",
     ),
-    glfw.KEY_F: ("friction", "coefficient", "training range 0.48 to 1.12"),
+    glfw.KEY_F: (
+        "friction",
+        "coefficient",
+        f"training range nominal +-{_LAST_STAGE.friction_fraction:.0%}",
+    ),
     glfw.KEY_X: ("CoM x (axle)", "mm", f"training range +-{_COM_RANGE_MM:g}"),
     glfw.KEY_Y: ("CoM y (forward)", "mm", f"training range +-{_COM_RANGE_MM:g}"),
     glfw.KEY_Z: ("CoM z (up)", "mm", f"training range +-{_COM_RANGE_MM:g}"),
@@ -125,7 +131,7 @@ class TeleopSim:
     def hold_command(self, linear_velocity: float, angular_velocity: float) -> None:
         """Use this command, scaled down together so the outer wheel stays within full speed
         (`SelfBalancingRobotEnv.wheel_feasible_command`), instead of random ones."""
-        full_speed = self.env.curriculum_config.command_limits[0]
+        full_speed = FULL_COMMAND[0]
         outer_wheel = abs(linear_velocity) + abs(angular_velocity) * self.env.half_track
         scale = min(1.0, full_speed / outer_wheel) if outer_wheel > 0 else 1.0
         self.command = np.array(
@@ -358,22 +364,22 @@ def main() -> None:
     )
     parser.add_argument(
         "--stage",
-        type=int,
-        default=2,
-        choices=range(1, 4),
-        help="2 = clean simulation, 3 = add noise, latency, slopes and random pushes.",
+        default="-1",
+        help="Curriculum stage to simulate, by name or index (default -1, the last: noise, "
+        'latency, slopes and pushes; "commands 0.3 m/s" for a clean simulation). Stages: '
+        + ", ".join(f'{i} "{s.name}"' for i, s in enumerate(CURRICULUM)),
     )
     parser.add_argument("--render-every", type=int, default=2, help="Render every N control steps.")
     args = parser.parse_args()
 
-    env = SelfBalancingRobotEnv(
-        curriculum_stage=args.stage,
-        difficulty_level=99,  # the stage's last level: full stage-3 slopes and pushes
-        fixed_difficulty=True,
-        max_episode_steps=2**31 - 1,
-    )
+    try:
+        env = SelfBalancingRobotEnv(
+            start_stage=args.stage, fixed_difficulty=True, max_episode_steps=2**31 - 1
+        )
+    except ValueError as error:
+        parser.error(str(error))
     actor = Actor.load(resolve_model(args.model))
-    linear_limit, angular_limit = DEFAULT_CURRICULUM_CONFIG.command_limits
+    linear_limit, angular_limit = FULL_COMMAND
     sim = TeleopSim(env)
     teleop = KeyboardTeleop(sim, linear_limit, angular_limit)
 

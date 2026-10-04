@@ -14,10 +14,10 @@ from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
 from self_balancing_robot.envs.wrappers import TrainingWrapper
 
 
-def benchmark(num_envs: int, stage: int, steps: int) -> tuple[float, float]:
+def benchmark(num_envs: int, stage: int | str, steps: int) -> tuple[float, float]:
     """(compile seconds, env steps per second)."""
     env = TrainingWrapper(
-        SelfBalancingRobotEnv(curriculum_stage=stage, difficulty_level=99, fixed_difficulty=True),
+        SelfBalancingRobotEnv(start_stage=stage, fixed_difficulty=True),
         curriculum=False,
     )
 
@@ -41,7 +41,9 @@ def benchmark(num_envs: int, stage: int, steps: int) -> tuple[float, float]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--num-envs", type=int, nargs="+", default=[1024, 4096])
-    parser.add_argument("--stage", type=int, default=3, choices=range(1, 4))
+    parser.add_argument(
+        "--stage", default="-1", help="Curriculum stage, by name or index (default the last)."
+    )
     parser.add_argument("--steps", type=int, default=100, help="Control steps per measurement.")
     args = parser.parse_args()
     print(f"Device: {jax.devices()[0].device_kind}, stage {args.stage}")

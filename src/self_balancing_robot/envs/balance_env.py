@@ -2,7 +2,7 @@
 
 The environment is functional: `reset(rng)` and `step(state, action)` return a new
 `State` and keep everything that changes over an episode (command, sensor and action
-buffers, randomized physics, curriculum stage and level) in `state.info`. Training runs
+buffers, randomized physics, curriculum stage) in `state.info`. Training runs
 thousands of copies with `jax.vmap` (see `envs/wrappers.py`); evaluation, teleop and
 export run single copies through `jax.jit`, on GPU or CPU.
 """
@@ -10,7 +10,6 @@ export run single copies through `jax.jit`, on GPU or CPU.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -21,15 +20,23 @@ from mujoco import mjx
 from mujoco_playground._src import mjx_env
 
 from self_balancing_robot.config import (
-    DEFAULT_CURRICULUM_CONFIG,
     DEFAULT_ENVIRONMENT_CONFIG,
-    DEFAULT_RANDOMIZATION_CONFIG,
     DEFAULT_REWARD_CONFIG,
-    CurriculumConfig,
-    CurriculumStage,
     EnvironmentConfig,
-    RandomizationConfig,
     RewardConfig,
+)
+from self_balancing_robot.curriculum import (
+    BANDED,
+    COMMAND_RESAMPLE_S,
+    CURRICULUM,
+    FULL_COMMAND,
+    REVERSAL_MIN_FRACTION,
+    SPEED_RATIO_MIN_COMMAND,
+    SPEED_RATIO_MIN_FRACTION,
+    SPEED_RATIO_SETTLE_S,
+    Stage,
+    stage_index,
+    stage_table,
 )
 
 State = mjx_env.State
@@ -40,7 +47,7 @@ ASSETS = Path(__file__).parents[1] / "assets"
 # `history_length` frames, newest first. Commands are divided by the full command range
 # (v / 0.3 m/s, omega / 1.5 rad/s) and wheel velocities by the motor no-load speed;
 # everything else is in SI units (rad, rad/s). With raw commands (|v| <= 0.1 at the first
-# ramp level) the policy ignored them and stood still; scaled, it learned to follow them.
+# command stage) the policy ignored them and stood still; scaled, it learned to follow them.
 ACTOR_FRAME_FIELDS = (
     "v_cmd",
     "omega_cmd",
@@ -82,10 +89,9 @@ ACTOR_KEY = "state"
 CRITIC_KEY = "privileged_state"
 
 # Info entries carried over from one episode to the next by `reset_episode`: the curriculum
-# position and the teleop settings (held command, pinned physics; NaN = not pinned).
+# stage and the teleop settings (held command, pinned physics; NaN = not pinned).
 PERSISTENT_KEYS = (
     "stage",
-    "level",
     "command_held",
     "command",
     "override_slope",
@@ -176,27 +182,39 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
     ``state`` (``actor_observation_size`` values) is what the deployed policy receives;
     ``privileged_state`` is only used by the critic during training.
 
-    ``curriculum_stage`` and ``difficulty_level`` set where new episodes start; during
-    training the curriculum wrapper moves them (see `envs/wrappers.py`) unless
-    ``fixed_difficulty`` is set.
+    What each episode samples comes from a stage of ``curriculum`` (see `curriculum.py`).
+    ``start_stage`` (index or name) is where episodes start; during training the curriculum
+    wrapper moves on through the list (see `envs/wrappers.py`) unless ``fixed_difficulty``
+    is set.
     """
 
     def __init__(
         self,
         reward_config: RewardConfig | None = None,
-        curriculum_config: CurriculumConfig | None = None,
-        randomization_config: RandomizationConfig | None = None,
         environment_config: EnvironmentConfig | None = None,
         max_episode_steps: int | None = None,
-        curriculum_stage: int = CurriculumStage.STABILIZATION,
-        difficulty_level: int = 1,
+        curriculum: tuple[Stage, ...] = CURRICULUM,
+        start_stage: int | str = 0,
         fixed_difficulty: bool = False,
         impl: str = "jax",
     ):
         self.environment_config = environment_config or DEFAULT_ENVIRONMENT_CONFIG
         self.reward_config = reward_config or DEFAULT_REWARD_CONFIG
-        self.curriculum_config = curriculum_config or DEFAULT_CURRICULUM_CONFIG
-        self.randomization_config = randomization_config or DEFAULT_RANDOMIZATION_CONFIG
+        self.curriculum = tuple(curriculum)
+        # One row per stage; `stage_params` picks the current stage's row inside JAX code.
+        self._table = stage_table(self.curriculum)
+        # Shapes and the critic's input scale must not change between stages, so they come
+        # from the largest values over the whole curriculum.
+        table = self._table
+        self._max_latency = int(table["max_latency_steps"].max())
+        self._privileged_scale = {
+            "com_offset": float(table["com_offset_max"].max()),
+            "mass": float(table["mass_fraction"].max()),
+            "friction": float(table["friction_fraction"].max()),
+            "push": float(table["push_max"].max()),
+            "slope": float(np.sin(table["slope_max"].max())),
+            "latency": float(max(self._max_latency, 1)),
+        }
         self.max_episode_steps = (
             max_episode_steps
             if max_episode_steps is not None
@@ -253,10 +271,9 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         pair = {self._ground_geom_id, self._base_geom_id}
         self._base_contacts = np.array([set(map(int, g)) == pair for g in contact_geoms])
 
-        # Evaluation environments stay at their stage and level (no curriculum).
+        # Evaluation environments stay at their stage (no curriculum).
         self.fixed_difficulty = fixed_difficulty
-        self.start_stage = int(CurriculumStage(curriculum_stage))
-        self.start_level = int(np.clip(difficulty_level, 1, self.max_level(self.start_stage)))
+        self.start_stage = self.stage_index(start_stage)
 
     # ------------------------------------------------------------------ MjxEnv interface
 
@@ -291,57 +308,45 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
 
     # ------------------------------------------------------------------ curriculum
 
-    def max_level(self, stage) -> Any:
-        """Number of levels of a stage (1 for stage 1); works on Python ints and arrays."""
-        cfg = self.curriculum_config
-        levels = (1, cfg.command_levels, cfg.randomization_levels)
-        if isinstance(stage, (int, np.integer)):
-            return levels[int(stage) - 1]
-        return jnp.array(levels)[stage - 1]
+    @property
+    def num_stages(self) -> int:
+        return len(self.curriculum)
 
-    def _level_fraction(self, stage, level) -> jax.Array:
-        return level / self.max_level(stage)
+    def stage_index(self, stage: int | str) -> int:
+        """Index of a curriculum stage given by name or index (-1 = the last one)."""
+        return stage_index(self.curriculum, stage)
 
-    def command_limits(self, stage, level) -> jax.Array:
-        """Maximum |v_cmd| (m/s) and |omega_cmd| (rad/s) at a stage and level."""
-        fraction = jnp.where(
-            stage == CurriculumStage.COMMAND_RAMP, self._level_fraction(stage, level), 1.0
-        )
-        fraction = jnp.where(stage == CurriculumStage.STABILIZATION, 0.0, fraction)
-        return fraction * jnp.asarray(self.curriculum_config.command_limits)
+    def stage_params(self, stage) -> dict[str, jax.Array]:
+        """The settings of a stage (`curriculum.stage_table` row); `stage` may be traced."""
+        return jax.tree.map(lambda column: jnp.asarray(column)[stage], self._table)
 
-    def _randomization_fraction(self, stage, level) -> jax.Array:
-        return jnp.where(
-            stage >= CurriculumStage.DOMAIN_RANDOMIZATION, self._level_fraction(stage, level), 0.0
-        )
-
-    def slope_limit(self, stage, level) -> jax.Array:
-        return self._randomization_fraction(stage, level) * self.randomization_config.slope_radians
-
-    def push_limit(self, stage, level) -> jax.Array:
-        return self._randomization_fraction(stage, level) * self.randomization_config.impulse_force_n
-
-    def com_offset_limit(self, stage, level) -> jax.Array:
-        return (
-            self._randomization_fraction(stage, level)
-            * self.randomization_config.center_of_mass_offset_m
-        )
-
-    def sample_level_magnitude(self, rng: jax.Array, limit: jax.Array, level) -> jax.Array:
-        """Magnitude in [0, limit] weighted towards the newest band of ``level`` (see config)."""
-        cfg = self.curriculum_config
+    @staticmethod
+    def sample_magnitude(
+        rng: jax.Array, floor, maximum, zero_probability, frontier_probability
+    ) -> jax.Array:
+        """Magnitude in [0, maximum]: 0 with `zero_probability`, in the stage's new band
+        [floor, maximum] with `frontier_probability`, otherwise below the band."""
         draw_key, frontier_key, below_key = jax.random.split(rng, 3)
-        band_floor = jnp.maximum(limit - limit / level, 0.0)
         draw = jax.random.uniform(draw_key)
-        frontier = jax.random.uniform(frontier_key, minval=band_floor, maxval=limit)
-        below = jax.random.uniform(below_key, minval=0.0, maxval=band_floor)
-        # At level 1 nothing lies below the newest band, so that share goes to the band.
-        use_frontier = (draw < cfg.level_zero_probability + cfg.level_frontier_probability) | (
-            band_floor <= 0.0
-        )
-        return jnp.where(
-            draw < cfg.level_zero_probability, 0.0, jnp.where(use_frontier, frontier, below)
-        )
+        frontier = jax.random.uniform(frontier_key, minval=floor, maxval=maximum)
+        below = jax.random.uniform(below_key, minval=0.0, maxval=floor)
+        # Without a band (floor 0) every non-zero draw is uniform up to the maximum.
+        use_frontier = (draw < zero_probability + frontier_probability) | (floor <= 0.0)
+        return jnp.where(draw < zero_probability, 0.0, jnp.where(use_frontier, frontier, below))
+
+    def _sample_banded(self, rng: jax.Array, params: dict, quantity: str, signed: bool = True):
+        """Draw `quantity` (command, slope, push, com_offset) of a stage, with a random sign."""
+        maximum = params[BANDED[quantity]]
+        floor = params[f"{quantity}_floor"]
+        keys = jax.random.split(rng, maximum.size + 1)
+        magnitude = jax.vmap(
+            lambda key, lo, hi: self.sample_magnitude(
+                key, lo, hi, params["zero_probability"], params["frontier_probability"]
+            )
+        )(keys[1:], jnp.ravel(floor), jnp.ravel(maximum)).reshape(maximum.shape)
+        if not signed:
+            return magnitude
+        return magnitude * jnp.where(jax.random.bernoulli(keys[0], shape=maximum.shape), 1.0, -1.0)
 
     def wheel_feasible_command(self, linear_velocity, angular_velocity) -> jax.Array:
         """Scale (v, omega) down together so the outer wheel stays within full speed.
@@ -351,7 +356,7 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         limit is the full command speed (0.3 m/s). The ESP32 should limit joystick commands
         the same way.
         """
-        full_speed = self.curriculum_config.command_limits[0]
+        full_speed = FULL_COMMAND[0]
         outer_wheel = jnp.abs(linear_velocity) + jnp.abs(angular_velocity) * self._half_track
         scale = jnp.where(
             outer_wheel > 0, jnp.minimum(1.0, full_speed / jnp.maximum(outer_wheel, 1e-9)), 1.0
@@ -363,35 +368,31 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """New (command, time until the next one, whether it is a reversal).
 
-        Stage 2 favours the newest command band; stage 3 (full range, slopes and pushes)
-        draws 0 or uniform. Stage 1 limits are 0. Mid-episode, some changes are reversals.
+        Speed and yaw rate are drawn with the stage's band sampling; mid-episode, a change is
+        a reversal with the stage's `reversal_probability`.
         """
-        cfg = self.curriculum_config
-        keys = jax.random.split(rng, 8)
-        stage, level = info["stage"], info["level"]
-        limits = self.command_limits(stage, level)
+        keys = jax.random.split(rng, 6)
+        params = self.stage_params(info["stage"])
+        limit = params["command_max"][0]
         previous = info["command"][0]
         direction = jnp.where(
             previous != 0,
             -jnp.sign(previous),
             jnp.where(jax.random.bernoulli(keys[0]), 1.0, -1.0),
         )
-        speed = jax.random.uniform(keys[1], minval=cfg.reversal_min_fraction, maxval=1.0)
-        reversal_command = jnp.stack([direction * speed * limits[0], 0.0])
+        speed = jax.random.uniform(keys[1], minval=REVERSAL_MIN_FRACTION, maxval=1.0)
+        reversal_command = jnp.stack([direction * speed * limit, 0.0])
         reversal = (
-            allow_reversal & (limits[0] > 0) & (jax.random.uniform(keys[2]) < cfg.reversal_probability)
+            allow_reversal
+            & (limit > 0)
+            & (jax.random.uniform(keys[2]) < params["reversal_probability"])
         )
-        sample_level = jnp.where(stage == CurriculumStage.DOMAIN_RANDOMIZATION, 1, level)
-        signs = jnp.where(jax.random.bernoulli(keys[3], shape=(2,)), 1.0, -1.0)
         random_command = self.wheel_feasible_command(
-            self.sample_level_magnitude(keys[4], limits[0], sample_level) * signs[0],
-            self.sample_level_magnitude(keys[5], limits[1], sample_level) * signs[1],
+            *self._sample_banded(keys[3], params, "command")
         )
         command = jnp.where(reversal, reversal_command, random_command)
         duration = jax.random.uniform(
-            keys[6],
-            minval=cfg.command_resample_seconds[0],
-            maxval=cfg.command_resample_seconds[1],
+            keys[4], minval=COMMAND_RESAMPLE_S[0], maxval=COMMAND_RESAMPLE_S[1]
         )
         return command, duration, reversal
 
@@ -451,11 +452,12 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
     # ------------------------------------------------------------------ observation
 
     def _scaled_command(self, command: jax.Array) -> jax.Array:
-        return command / jnp.asarray(self.curriculum_config.command_limits)
+        return command / jnp.asarray(FULL_COMMAND)
 
     def _observe(self, data: mjx.Data, info: dict, rng: jax.Array, first: bool) -> tuple[dict, dict]:
         """Push the current sensor readings into the buffers; return (obs, info)."""
-        cfg = self.randomization_config
+        params = self.stage_params(info["stage"])
+        scale = self._privileged_scale
         rotation = self._rotation(data.qpos)
         measurement = jnp.concatenate(
             [self._imu_measurement(rotation, data.qvel), self._encoder_measurement(data.qvel)]
@@ -469,15 +471,14 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         angle_key, rate_key, encoder_key = jax.random.split(rng, 3)
         noise = jnp.concatenate(
             [
-                cfg.imu_angle_noise_rad * jax.random.normal(angle_key, (2,)),
-                cfg.imu_rate_noise_rad_s * jax.random.normal(rate_key, (3,)),
-                cfg.encoder_velocity_noise_rad_s
+                params["imu_angle_noise"] * jax.random.normal(angle_key, (2,)),
+                params["imu_rate_noise"] * jax.random.normal(rate_key, (3,)),
+                params["encoder_noise"]
                 / self._max_wheel_speed
                 * jax.random.normal(encoder_key, (2,)),
             ]
         )
-        noisy = info["stage"] >= CurriculumStage.DOMAIN_RANDOMIZATION
-        measured = jnp.concatenate([imu, encoders]) + jnp.where(noisy, noise, 0.0)
+        measured = jnp.concatenate([imu, encoders]) + noise
         scaled_command = self._scaled_command(info["command"])
         frame = jnp.concatenate([scaled_command, measured, info["previous_action"]])
         if first:
@@ -490,29 +491,25 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         latencies = jnp.stack(
             [info["motor_latency"], info["imu_latency"], info["encoder_latency"]]
         ).astype(jnp.float32)
-        max_latencies = np.array(
-            [cfg.max_motor_latency_steps, cfg.max_imu_latency_steps, cfg.max_encoder_latency_steps],
-            dtype=np.float32,
-        )
         privileged = jnp.concatenate(
             [
                 scaled_command,
                 measurement,
                 info["previous_action"],
                 jnp.stack([forward_velocity, lateral_velocity]),
-                _normalized(info["com_offset"], cfg.center_of_mass_offset_m),
+                _normalized(info["com_offset"], scale["com_offset"]),
                 jnp.stack(
                     [
-                        _normalized(info["mass_scale"] - 1.0, cfg.mass_fraction),
-                        _normalized(info["friction_scale"] - 1.0, cfg.friction_fraction),
-                        _normalized(info["push_force"] @ forward, cfg.impulse_force_n),
-                        _normalized(info["push_force"] @ lateral, cfg.impulse_force_n),
+                        _normalized(info["mass_scale"] - 1.0, scale["mass"]),
+                        _normalized(info["friction_scale"] - 1.0, scale["friction"]),
+                        _normalized(info["push_force"] @ forward, scale["push"]),
+                        _normalized(info["push_force"] @ lateral, scale["push"]),
                     ]
                 ),
-                latencies / np.maximum(max_latencies, 1.0),
+                latencies / scale["latency"],
                 _normalized(
                     jnp.stack([info["ground_normal"][:2] @ forward, info["ground_normal"][:2] @ lateral]),
-                    np.sin(cfg.slope_radians),
+                    scale["slope"],
                 ),
             ]
         )
@@ -521,16 +518,14 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         return obs, info
 
     def _sensor_buffer_length(self) -> int:
-        cfg = self.randomization_config
-        return max(cfg.max_imu_latency_steps, cfg.max_encoder_latency_steps) + 1
+        return self._max_latency + 1
 
     # ------------------------------------------------------------------ reset
 
     def initial_persistent(self) -> dict:
-        """Persistent info for the first episode: start stage/level, nothing pinned."""
+        """Persistent info for the first episode: start stage, nothing pinned."""
         return {
             "stage": jnp.int32(self.start_stage),
-            "level": jnp.int32(self.start_level),
             "command_held": jnp.array(False),
             "command": jnp.zeros(2),
             "override_slope": jnp.float32(jnp.nan),
@@ -542,47 +537,24 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         return self.reset_episode(rng, self.initial_persistent())
 
     def reset_episode(self, rng: jax.Array, persistent: dict) -> State:
-        """Start an episode at the stage/level (and with the teleop settings) in `persistent`."""
+        """Start an episode at the stage (and with the teleop settings) in `persistent`."""
         env_cfg = self.environment_config
-        cfg = self.randomization_config
         keys = jax.random.split(rng, 20)
-        stage, level = persistent["stage"], persistent["level"]
-        randomize = stage >= CurriculumStage.DOMAIN_RANDOMIZATION
+        stage = persistent["stage"]
+        params = self.stage_params(stage)
 
-        def signed(key, limit):
-            magnitude_key, sign_key = jax.random.split(key)
-            sign = jnp.where(jax.random.bernoulli(sign_key), 1.0, -1.0)
-            return self.sample_level_magnitude(magnitude_key, limit, level) * sign
-
-        # Randomized physics (stage 3); teleop overrides take precedence.
-        mass_scale = jnp.where(
-            randomize,
-            jax.random.uniform(keys[0], minval=1 - cfg.mass_fraction, maxval=1 + cfg.mass_fraction),
-            1.0,
+        # Randomized physics (zero ranges in early stages); teleop overrides take precedence.
+        mass_scale = jax.random.uniform(
+            keys[0], minval=1 - params["mass_fraction"], maxval=1 + params["mass_fraction"]
         )
-        com_limit = self.com_offset_limit(stage, level)
-        com_offset = jnp.where(
-            randomize, jnp.stack([signed(k, com_limit) for k in jax.random.split(keys[1], 3)]), 0.0
-        )
-        friction_scale = jnp.where(
-            randomize,
-            jax.random.uniform(
-                keys[2], minval=1 - cfg.friction_fraction, maxval=1 + cfg.friction_fraction
-            ),
-            1.0,
+        com_offset = self._sample_banded(keys[1], params, "com_offset")
+        friction_scale = jax.random.uniform(
+            keys[2], minval=1 - params["friction_fraction"], maxval=1 + params["friction_fraction"]
         )
         latency = [
-            jnp.where(randomize, jax.random.randint(key, (), 0, maximum + 1), 0)
-            for key, maximum in zip(
-                keys[3:6],
-                (
-                    cfg.max_motor_latency_steps,
-                    cfg.max_imu_latency_steps,
-                    cfg.max_encoder_latency_steps,
-                ),
-            )
+            jax.random.randint(key, (), 0, params["max_latency_steps"] + 1) for key in keys[3:6]
         ]
-        slope = jnp.where(randomize, signed(keys[6], self.slope_limit(stage, level)), 0.0)
+        slope = self._sample_banded(keys[6], params, "slope")
         slope_axis_angle = jax.random.uniform(keys[7], minval=-jnp.pi, maxval=jnp.pi)
 
         pinned_slope = ~jnp.isnan(persistent["override_slope"])
@@ -634,9 +606,7 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         info = {
             "rng": keys[11],
             "stage": stage,
-            "level": level,
             "episode_stage": stage,
-            "episode_level": level,
             "command_held": persistent["command_held"],
             "override_slope": persistent["override_slope"],
             "override_friction": persistent["override_friction"],
@@ -644,7 +614,7 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             "command": persistent["command"],
             "episode_step": jnp.int32(0),
             "previous_action": jnp.zeros(2),
-            "action_queue": jnp.zeros((cfg.max_motor_latency_steps + 1, 2)),
+            "action_queue": jnp.zeros((self._max_latency + 1, 2)),
             "motor_latency": latency[0],
             "imu_latency": latency[1],
             "encoder_latency": latency[2],
@@ -656,11 +626,9 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             "push_force": jnp.zeros(2),
             "push_end_time": jnp.float32(0.0),
             "next_impulse_time": jax.random.uniform(
-                keys[12],
-                minval=cfg.impulse_interval_seconds[0],
-                maxval=cfg.impulse_interval_seconds[1],
+                keys[12], minval=params["push_interval_s"][0], maxval=params["push_interval_s"][1]
             ),
-            # Level-up sums: (speed reached along the command, commanded speed, |v| on zero
+            # Sums for the stage's test: (speed reached along the command, commanded speed, |v| on zero
             # speed commands, steps on zero speed commands).
             "episode_tracking": jnp.zeros(4),
             "episode_reversal": jnp.array(False),
@@ -686,30 +654,28 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
     # ------------------------------------------------------------------ step
 
     def _update_disturbance(self, info: dict, rng: jax.Array) -> dict:
-        """Random pushes on the base (stage 3), as a force in the world xy-plane."""
-        cfg = self.randomization_config
+        """Random pushes on the base (if the stage has any), as a force in the world xy-plane."""
+        params = self.stage_params(info["stage"])
         direction_key, magnitude_key, interval_key = jax.random.split(rng, 3)
         time = info["episode_step"] * self.dt
-        randomize = info["stage"] >= CurriculumStage.DOMAIN_RANDOMIZATION
-        start = randomize & (time >= info["next_impulse_time"])
+        pushes = params["push_max"] > 0
+        start = pushes & (time >= info["next_impulse_time"])
         direction = jax.random.uniform(direction_key, minval=-jnp.pi, maxval=jnp.pi)
-        magnitude = self.sample_level_magnitude(
-            magnitude_key, self.push_limit(info["stage"], info["level"]), info["level"]
-        )
+        magnitude = self._sample_banded(magnitude_key, params, "push", signed=False)
         push = jnp.where(
             start, magnitude * jnp.stack([jnp.cos(direction), jnp.sin(direction)]), info["push_force"]
         )
-        push_end = jnp.where(start, time + cfg.impulse_duration_seconds, info["push_end_time"])
+        push_end = jnp.where(start, time + params["push_duration_s"], info["push_end_time"])
         next_impulse = info["next_impulse_time"] + jnp.where(
             start,
             jax.random.uniform(
                 interval_key,
-                minval=cfg.impulse_interval_seconds[0],
-                maxval=cfg.impulse_interval_seconds[1],
+                minval=params["push_interval_s"][0],
+                maxval=params["push_interval_s"][1],
             ),
             0.0,
         )
-        push = jnp.where((time >= push_end) | ~randomize, 0.0, push)
+        push = jnp.where((time >= push_end) | ~pushes, 0.0, push)
         return {
             **info,
             "push_force": push,
@@ -718,18 +684,17 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         }
 
     def _track_command(self, info: dict, forward_velocity: jax.Array) -> dict:
-        """Accumulate the speed-ratio and standing-still sums used to level up."""
-        cfg = self.curriculum_config
+        """Accumulate the speed-ratio and standing-still sums of the stage's test."""
         linear = info["command"][0]
-        settled = info["command_age"] >= cfg.speed_ratio_settle_seconds
+        settled = info["command_age"] >= SPEED_RATIO_SETTLE_S
         still = settled & (linear == 0.0)
-        limit = self.command_limits(info["stage"], info["level"])[0]
+        limit = self.stage_params(info["stage"])["command_max"][0]
         moving = (
             settled
             & (linear != 0.0)
             & (
                 jnp.abs(linear)
-                >= jnp.maximum(cfg.speed_ratio_min_fraction * limit, cfg.speed_ratio_min_command)
+                >= jnp.maximum(SPEED_RATIO_MIN_FRACTION * limit, SPEED_RATIO_MIN_COMMAND)
             )
         )
         # Speed along the commanded direction (driving backwards counts against).

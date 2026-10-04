@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import mujoco
@@ -5,7 +7,15 @@ import numpy as np
 import pytest
 from conftest import make_env, persistent, reset, set_info, step
 
-from self_balancing_robot.config import RandomizationConfig, RewardConfig
+from self_balancing_robot.config import RewardConfig
+from self_balancing_robot.curriculum import (
+    BALANCE,
+    CURRICULUM,
+    FULL_COMMAND,
+    RANDOMIZATION_1,
+    REVERSAL_MIN_FRACTION,
+    SPEED_RATIO_SETTLE_S,
+)
 from self_balancing_robot.envs.balance_env import (
     ACTOR_FRAME_SIZE,
     ACTOR_KEY,
@@ -19,6 +29,11 @@ from self_balancing_robot.envs.balance_env import (
 )
 
 PITCH = 3  # index of pitch in a frame (actor history and privileged state)
+# Stages of the default curriculum used below.
+COMMANDS_LOW = "commands 0.1 m/s"
+COMMANDS_FULL = "commands 0.3 m/s"
+RANDOMIZED = "randomization 1/6"
+LAST = -1
 
 
 def _pitched(state, pitch, lift=0.0):
@@ -59,7 +74,7 @@ def test_environment_reset_and_step(env):
     state = step(env, state)
     assert np.isfinite(state.reward)
     assert state.done == 0 and state.info["truncation"] == 0
-    assert state.info["stage"] == 1
+    assert state.info["stage"] == 0
     assert np.all(state.info["command"] == 0.0)
     assert set(state.info["reward_terms"]) == set(REWARD_TERMS)
 
@@ -93,7 +108,7 @@ def test_reward_components_follow_configured_weights(env):
 
 
 def test_action_penalties_use_policy_action_not_delayed_action(env):
-    state = set_info(reset(env, seed=5, stage=3), motor_latency=2)
+    state = set_info(reset(env, seed=5, stage=RANDOMIZED), motor_latency=2)
     state = step(env, state, (0.5, -0.5))
     assert state.info["reward_terms"]["action"] == -0.5
     assert state.info["reward_terms"]["smoothness"] == -0.5
@@ -119,7 +134,7 @@ def test_pitch_failure_terminates_with_zero_reward(env):
 
 def test_spinning_in_place_terminates_like_a_fall(env):
     limit = env.environment_config.yaw_rate_limit_rad_s
-    assert limit >= 2 * env.curriculum_config.command_limits[1]  # never hit while tracking
+    assert limit >= 2 * FULL_COMMAND[1]  # never hit while tracking
     state = reset(env, seed=3)
     qvel = state.data.qvel.at[5].set(5 * limit)  # body z: yaw (wheel friction brakes it fast)
     state = step(env, state.replace(data=state.data.replace(qvel=qvel)))
@@ -128,7 +143,7 @@ def test_spinning_in_place_terminates_like_a_fall(env):
 
 
 def test_reset_with_same_seed_reproduces_initial_observation(env):
-    first, second = reset(env, seed=4, stage=3), reset(env, seed=4, stage=3)
+    first, second = reset(env, seed=4, stage=LAST), reset(env, seed=4, stage=LAST)
     np.testing.assert_allclose(first.obs[ACTOR_KEY], second.obs[ACTOR_KEY])
     np.testing.assert_allclose(first.obs[CRITIC_KEY], second.obs[CRITIC_KEY])
 
@@ -146,12 +161,9 @@ def test_actor_history_shifts_newest_frame_first(env):
 
 
 def test_sensor_latency_delays_the_actor_frame_but_not_the_privileged_state():
-    env = make_env(
-        randomization_config=RandomizationConfig(
-            imu_angle_noise_rad=0.0, imu_rate_noise_rad_s=0.0, encoder_velocity_noise_rad_s=0.0
-        )
-    )
-    state = set_info(reset(env, seed=7, stage=3), imu_latency=2)
+    quiet = replace(RANDOMIZATION_1, imu_angle_noise=0.0, imu_rate_noise=0.0, encoder_noise=0.0)
+    env = make_env(curriculum=(BALANCE, quiet))
+    state = set_info(reset(env, seed=7, stage=1), imu_latency=2)
     observations = []
     for _ in range(4):
         state = step(env, state, (0.3, 0.3))
@@ -160,13 +172,13 @@ def test_sensor_latency_delays_the_actor_frame_but_not_the_privileged_state():
     assert observations[3][ACTOR_KEY][PITCH] != observations[3][CRITIC_KEY][PITCH]
 
 
-def test_domain_randomization_changes_physics_only_in_stage_three(env):
-    for stage in (1, 2):
-        info = reset(env, seed=8, stage=stage, level=env.max_level(stage)).info
+def test_physics_is_randomized_only_where_the_stage_says_so(env):
+    for stage in ("balance", COMMANDS_FULL):
+        info = reset(env, seed=8, stage=stage).info
         assert info["mass_scale"] == 1.0 and info["friction_scale"] == 1.0
         assert np.all(info["com_offset"] == 0.0) and info["ground_normal"][2] == 1.0
         assert info["motor_latency"] == 0
-    info = reset(env, seed=8, stage=3, level=env.max_level(3)).info
+    info = reset(env, seed=8, stage=LAST).info
     assert info["mass_scale"] != 1.0 and info["friction_scale"] != 1.0
     assert info["ground_normal"][2] < 1.0
     model = env._episode_model(info)
@@ -175,11 +187,10 @@ def test_domain_randomization_changes_physics_only_in_stage_three(env):
 
 
 def test_commands_stay_within_wheel_speed(env):
-    full_speed = env.curriculum_config.command_limits[0]
+    full_speed = FULL_COMMAND[0]
     keys = jax.random.split(jax.random.PRNGKey(0), 200)
-    commands = jax.vmap(lambda key: env.reset_episode(key, persistent(env, 2, 3)).info["command"])(
-        keys
-    )
+    start = persistent(env, COMMANDS_FULL)
+    commands = jax.vmap(lambda key: env.reset_episode(key, start).info["command"])(keys)
     outer_wheel = np.abs(commands[:, 0]) + np.abs(commands[:, 1]) * env.half_track
     assert np.all(outer_wheel <= full_speed + 1e-6)
     linear, angular = env.wheel_feasible_command(full_speed, -1.5)  # joystick corner
@@ -188,25 +199,25 @@ def test_commands_stay_within_wheel_speed(env):
     np.testing.assert_allclose(env.wheel_feasible_command(0.2, 0.5), [0.2, 0.5])  # feasible
 
 
-def test_command_ramp_widens_commands_level_by_level(env):
-    cfg = env.curriculum_config
-    full = np.array(cfg.command_limits)
-    np.testing.assert_allclose(env.command_limits(1, 1), 0.0)
-    for level in (1, cfg.command_levels):
-        limits = np.array(env.command_limits(2, level))
-        np.testing.assert_allclose(limits, full * level / cfg.command_levels, rtol=1e-6)
-        for seed in range(20):
-            command = reset(env, seed=seed, stage=2, level=level).info["command"]
-            assert np.all(np.abs(command) <= limits + 1e-6)
-        assert env.slope_limit(2, level) == 0.0 and env.push_limit(2, level) == 0.0
-    np.testing.assert_allclose(env.command_limits(3, 1), full)
+def test_samples_stay_within_each_stages_maxima(env):
+    keys = jax.random.split(jax.random.PRNGKey(2), 50)
+    for index, stage in enumerate(CURRICULUM):
+        start = persistent(env, index)
+        info = jax.vmap(lambda key, start=start: env.reset_episode(key, start).info)(keys)
+        assert np.all(np.abs(info["command"]) <= np.array(stage.command_max) + 1e-6), stage.name
+        assert np.all(np.abs(info["slope"]) <= stage.slope_max + 1e-6), stage.name
+        assert np.all(np.abs(info["com_offset"]) <= stage.com_offset_max + 1e-6), stage.name
+        assert np.all(np.abs(info["mass_scale"] - 1) <= stage.mass_fraction + 1e-6), stage.name
+        assert np.all(info["motor_latency"] <= stage.max_latency_steps), stage.name
+        if stage.command_max[0] > 0:  # the new band is actually reached
+            assert np.abs(info["command"][:, 0]).max() > 0.5 * stage.command_max[0], stage.name
 
 
 def test_reversals_flip_direction_near_full_speed(env):
-    cfg = env.curriculum_config
-    info = reset(env, seed=21, stage=2, level=3).info
+    stage = CURRICULUM[env.stage_index(COMMANDS_FULL)]
+    info = reset(env, seed=21, stage=COMMANDS_FULL).info
     info = {**info, "command": jnp.array([0.25, 0.5])}
-    limit = float(env.command_limits(2, 3)[0])
+    limit = stage.command_max[0]
     keys = jax.random.split(jax.random.PRNGKey(1), 4_000)
 
     def sample(allow_reversal, info=info):
@@ -214,19 +225,19 @@ def test_reversals_flip_direction_near_full_speed(env):
 
     commands, _, reversals = sample(True)
     commands, reversals = np.asarray(commands), np.asarray(reversals)
-    assert np.isclose(reversals.mean(), cfg.reversal_probability, atol=0.02)
+    assert np.isclose(reversals.mean(), stage.reversal_probability, atol=0.02)
     linear = -commands[reversals, 0]
-    assert np.all((linear >= cfg.reversal_min_fraction * limit - 1e-6) & (linear <= limit + 1e-6))
+    assert np.all((linear >= REVERSAL_MIN_FRACTION * limit - 1e-6) & (linear <= limit + 1e-6))
     assert np.all(commands[reversals, 1] == 0.0)
     assert not np.any(sample(False)[2])  # never at reset
-    stage_one = {**info, "stage": jnp.int32(1), "level": jnp.int32(1)}
-    commands, _, reversals = sample(True, stage_one)  # no commands in stage 1
+    balance = {**info, "stage": jnp.int32(0)}
+    commands, _, reversals = sample(True, balance)  # no commands while balancing
     assert not np.any(reversals) and np.all(np.asarray(commands) == 0.0)
 
 
 def test_speed_tracking_skips_acceleration_and_small_commands(env):
-    info = reset(env, seed=0, stage=2, level=3).info
-    settle_steps = int(np.ceil(env.curriculum_config.speed_ratio_settle_seconds / env.dt))
+    info = reset(env, seed=0, stage=COMMANDS_FULL).info
+    settle_steps = int(np.ceil(SPEED_RATIO_SETTLE_S / env.dt))
 
     def track(command, steps, forward_velocity=0.2):
         tracked = {
@@ -250,7 +261,7 @@ def test_speed_tracking_skips_acceleration_and_small_commands(env):
 
 
 def test_held_command_is_not_resampled(env):
-    state = reset(env, seed=10, stage=2, level=3, command_held=True, command=[0.2, -0.5])
+    state = reset(env, seed=10, stage=COMMANDS_FULL, command_held=True, command=[0.2, -0.5])
 
     def body(state, _):
         state = env.step(state, jnp.zeros(2))
@@ -267,13 +278,13 @@ def test_physics_overrides_pin_friction_com_and_slope(env):
         "override_com": [0.0, 0.004, -0.002],
     }
     for seed in range(3):  # overrides beat stage-3 randomization at every reset
-        info = reset(env, seed=seed, stage=3, level=6, **pinned).info
+        info = reset(env, seed=seed, stage=LAST, **pinned).info
         assert np.isclose(info["slope"], 0.3)
         assert np.isclose(info["friction_scale"] * env.nominal_ground_friction, 0.5)
         np.testing.assert_allclose(info["com_offset"], [0.0, 0.004, -0.002])
         model = env._episode_model(info)
         np.testing.assert_allclose(model.geom_friction[:, 0], 0.5, rtol=1e-6)
-    info = reset(env, seed=13, stage=3, level=6).info
+    info = reset(env, seed=13, stage=LAST).info
     assert not np.isclose(info["friction_scale"] * env.nominal_ground_friction, 0.5)
 
 
@@ -319,47 +330,30 @@ def test_tracking_reward_still_rewards_progress_far_from_the_command():
     assert reward[-1] == 1.0
 
 
-def test_stage_three_levels_ramp_slope_and_push_together(env):
-    randomization = env.randomization_config
-    for seed in range(5):
-        info = reset(env, seed=seed, stage=3, level=1).info
-        assert abs(info["slope"]) <= env.slope_limit(3, 1) + 1e-6
-        assert np.all(np.abs(info["com_offset"]) <= env.com_offset_limit(3, 1) + 1e-6)
-    last = env.max_level(3)
-    limits = [float(env.slope_limit(3, level)) for level in range(1, last + 1)]
-    assert limits == sorted(limits)
-    assert np.isclose(env.slope_limit(3, last), randomization.slope_radians)
-    assert np.isclose(env.push_limit(3, last), randomization.impulse_force_n)
-    assert np.isclose(env.com_offset_limit(3, last), randomization.center_of_mass_offset_m)
-
-
-def test_level_sampling_favours_the_newest_band_but_keeps_easier_values(env):
-    cfg = env.curriculum_config
-    levels = cfg.randomization_levels
-    limit = env.slope_limit(3, levels)
-    band_floor = limit - limit / levels
-
-    def samples(level, count):
-        keys = jax.random.split(jax.random.PRNGKey(level), count)
-        return np.asarray(jax.vmap(lambda key: env.sample_level_magnitude(key, limit, level))(keys))
-
-    values = samples(levels, 20_000)
-    assert np.all((values >= 0) & (values <= limit + 1e-6))
-    assert np.isclose(np.mean(values == 0), cfg.level_zero_probability, atol=0.01)
-    assert np.isclose(np.mean(values >= band_floor), cfg.level_frontier_probability, atol=0.015)
-    assert np.isclose(np.mean((values > 0) & (values < band_floor)), 0.5, atol=0.015)
-    values = samples(1, 5_000)  # nothing below the first band: it gets that share
-    assert np.isclose(np.mean(values == 0), cfg.level_zero_probability, atol=0.015)
+@pytest.mark.parametrize("floor", [0.25, 0.0])
+def test_magnitude_sampling_favours_the_new_band_but_keeps_easier_values(env, floor):
+    maximum, zero, frontier = 0.3, 0.1, 0.4
+    keys = jax.random.split(jax.random.PRNGKey(0), 20_000)
+    values = np.asarray(
+        jax.vmap(lambda key: env.sample_magnitude(key, floor, maximum, zero, frontier))(keys)
+    )
+    assert np.all((values >= 0) & (values <= maximum + 1e-6))
+    assert np.isclose(np.mean(values == 0), zero, atol=0.01)
+    if floor > 0:
+        assert np.isclose(np.mean(values >= floor), frontier, atol=0.015)
+        assert np.isclose(np.mean((values > 0) & (values < floor)), 1 - zero - frontier, atol=0.015)
+    else:  # no band: every non-zero draw is uniform up to the maximum
+        assert np.isclose(np.mean(values >= maximum / 2), (1 - zero) / 2, atol=0.015)
 
 
 def test_yaw_rate_reward_uses_the_narrow_kernel_only(env):
-    state = step(env, reset(env, seed=17, stage=2, command_held=True, command=[0.0, 1.0]))
+    state = step(env, reset(env, seed=17, stage=COMMANDS_LOW, command_held=True, command=[0.0, 1.0]))
     error = state.info["yaw_rate"] - 1.0
     expected = np.exp(-(error**2) / env.reward_config.angular_velocity_variance)
     assert np.isclose(state.info["reward_terms"]["angular_velocity"], expected, rtol=1e-5)
 
 
-@pytest.mark.parametrize("stage", [1, 3])
+@pytest.mark.parametrize("stage", [0, LAST])
 def test_jitted_step_keeps_the_state_structure(env, stage):
     # reset and step must return identical pytrees for lax.scan and the auto-reset select.
     state = reset(env, seed=0, stage=stage)

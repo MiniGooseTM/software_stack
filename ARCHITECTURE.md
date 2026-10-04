@@ -74,7 +74,7 @@ This pipeline trains the lightweight ESP32 policy directly using Reinforcement L
 *   **Simulation:** MuJoCo MJX (JAX) runs thousands of copies of the robot in parallel on one GPU (`envs/balance_env.py`). The robot model is `assets/goose.xml`, placed on a tiltable ground plane by `assets/env_v0.xml`; the MJX copy drops the visual meshes and caps the constraint solver at 4 iterations (trajectories match MuJoCo's default of 100 to ~1e-6; 2.6x faster in a batch). The same environment runs on the CPU for evaluation, teleop, export and tests.
 *   **PPO:** Brax PPO (`train.py`), 4,096 environments, 32-step rollouts, 16 minibatches, 4 epochs, learning rate 3e-4, $\gamma = 0.99$, $\lambda = 0.95$, clip 0.2, entropy 0.01. On an RTX 4050 laptop GPU it runs ~165k environment steps per second in training (the earlier SB3 setup ran on 8 CPU cores).
 *   **Networks:** as in 3.1, ReLU. The action distribution is a plain Gaussian (no tanh) with a learned state-independent std (initially 0.61), so the deterministic action is the linear output that the firmware clips. Weights start as in SB3 (orthogonal, action layer gain 0.01), so training starts near zero action. Some runs still learned to balance while spinning in place at ~8 rad/s, so spinning faster than 3 rad/s now ends the episode (REWARDS.md section 4).
-*   **Episodes:** a finished environment starts a fresh episode at once (new slope, physics, heading and command at the current curriculum level), and timeouts are bootstrapped (Brax's `truncation`). The curriculum is global (`envs/wrappers.py`, REWARDS.md section 3).
+*   **Episodes:** a finished environment starts a fresh episode at once (new slope, physics, heading and command at the current curriculum stage), and timeouts are bootstrapped (Brax's `truncation`). The curriculum is global (`envs/wrappers.py`, REWARDS.md section 3).
 
 ---
 
@@ -188,7 +188,7 @@ The same export also writes the **policy file** `models/policy.bin` (format in t
 *   A CRC-32 of the whole file, which also identifies the policy in the firmware log.
 
 ### 4.8 What the Policy Was Trained to Handle
-*   Mass +-10%, CoM shift up to 8 mm per axis, floor friction +-40%, slopes up to 0.3 rad, pushes up to 1 N for 0.1 s, sensor noise and 0-2 steps of latency (see `RandomizationConfig` in `config.py`).
+*   Mass +-10%, CoM shift up to 8 mm per axis, floor friction +-40%, slopes up to 0.3 rad, pushes up to 1 N for 0.1 s, sensor noise and 0-2 steps of latency (the last stage of `CURRICULUM` in `curriculum.py`).
 *   Known weaknesses (`models/archive/v10_reversals_30M/README.md`): forward speed undershoots by ~20%, a forward CoM shift turns into a speed offset (no integral term), and survival on slopes above 0.2 rad is low.
 *   Training ends an episode when roll or pitch passes 0.6 rad, the robot spins faster than 3 rad/s, or the chassis touches the ground: past that the policy has never been trained, so cut the motors there.
 

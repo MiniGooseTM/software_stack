@@ -20,14 +20,16 @@ On an RTX 4050 laptop GPU training runs ~165k environment steps per second (4,09
 Each run writes to its own directory, `models/runs/<date-time>/` (or `--run-dir`):
 
 - `params.pkl`: the latest weights (actor, critic), saved every `--eval-freq` steps (5M);
-- `curriculum.json`: curriculum stage and level, and the total number of steps;
-- `config.json`: all settings of the run;
-- `plots/training_metrics.png`: reward, survival, velocity and yaw-rate tracking error and mean |pitch| of deterministic episodes at the current curriculum level and at the final difficulty (stage 3, last level), and the curriculum progress; `plots/eval_episode_latest.png` / `eval_episode_final.png`: command vs response of one episode;
+- `curriculum.json`: curriculum stage (index and name) and the total number of steps;
+- `config.json`: all settings of the run, including the curriculum;
+- `plots/training_metrics.png`: reward, survival, velocity and yaw-rate tracking error and mean |pitch| of deterministic episodes at the current curriculum stage and at the last stage, and the curriculum stage over time; `plots/eval_episode_latest.png` / `eval_episode_final.png`: command vs response of one episode;
 - `videos/`: an MP4 of one episode every `--video-freq` steps (25M) and at the end.
 
-The same numbers, the PPO losses and the curriculum go to TensorBoard: `.venv/bin/tensorboard --logdir logs`. Curriculum level changes are also printed as they happen.
+The same numbers, the PPO losses and the curriculum go to TensorBoard: `.venv/bin/tensorboard --logdir logs`. Curriculum stage changes are also printed as they happen.
 
-Continue a run with `make train TRAIN_ARGS="--resume models/runs/<run>"`; it picks up the weights and the curriculum stage and level (`--start-stage` / `--start-level` override them), and `--timesteps` counts the extra steps. Stages: 1 balance, 2 command ramp, 3 slopes and pushes. Other options: `--num-envs` (a multiple of 16), `--seed`, `--eval-freq`, `--video-freq`. Shared defaults are in `src/self_balancing_robot/config.py`; MuJoCo model and geometry values are defined in the XML.
+Continue a run with `make train TRAIN_ARGS="--resume models/runs/<run>"`; it picks up the weights and the curriculum stage (matched by name, so stages added earlier in the list do not shift it; `--start-stage <name or index>` overrides it), and `--timesteps` counts the extra steps. Other options: `--num-envs` (a multiple of 16), `--seed`, `--eval-freq`, `--video-freq`.
+
+**The curriculum** is the list of stages in `src/self_balancing_robot/curriculum.py`: each stage sets what the environment samples (command range, slopes, pushes, randomized physics, latency, noise) and the test to leave it. Add or change stages there (REWARDS.md, section 3). Other defaults (reward, environment, network, PPO) are in `src/self_balancing_robot/config.py`; MuJoCo model and geometry values are defined in the XML.
 
 ## University cluster
 
@@ -62,10 +64,10 @@ The script installs the environment on first use (with `uv` if available, which 
 
 ## Evaluation, driving and export
 
-`make evaluate EVALUATE_ARGS="--stage 3"` runs deterministic episodes of the newest run (or `--model <run dir or policy.bin>`) at the last level of a curriculum stage, in parallel, and prints per-episode metrics; `--plot-dir plots/eval` saves a plot of every episode and `--video eval.mp4` records the first one.
+`make evaluate` runs deterministic episodes of the newest run (or `--model <run dir or policy.bin>`) at the last curriculum stage (or `--stage <name or index>`, e.g. `EVALUATE_ARGS='--stage "commands 0.3 m/s"'`), in parallel, and prints per-episode metrics; `--plot-dir plots/eval` saves a plot of every episode and `--video eval.mp4` records the first one.
 
-To drive a trained policy yourself, run `make teleop` (or `make teleop TELEOP_ARGS="--stage 3"` to add
-noise, slopes and random pushes). A window opens with a camera behind and above the robot: hold the
+To drive a trained policy yourself, run `make teleop`. It simulates the last curriculum stage (noise, latency,
+slopes and random pushes); `make teleop TELEOP_ARGS='--stage "commands 0.3 m/s"'` gives a clean simulation. A window opens with a camera behind and above the robot: hold the
 arrow keys to drive and turn, `+`/`-` change the speed limit (starts at 100% = 0.3 m/s and 1.5 rad/s, the
 training range; like in training, speed and turn rate are scaled down together when the outer wheel
 would need more than 0.3 m/s, so the ESP32 should limit joystick commands the same way), `V` cycles the camera (chase, top-down, side, free mouse view), Backspace
