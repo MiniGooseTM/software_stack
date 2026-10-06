@@ -3,7 +3,8 @@
 Training saves the states of each recorded episode (``videos/<name>.npz``) and renders them in
 a child process: a missing or broken OpenGL setup can abort the whole process (a headless
 server without a display, or a MIG GPU slice, which has no graphics support), and that must
-never stop training. The child tries the OpenGL backends one after the other. If none works,
+never stop training. The child tries the OpenGL backends one after the other; for OSMesa it
+also uses the libraries ``scripts/setup_osmesa.sh`` extracts (no sudo needed). If none works,
 the states files stay; render them on another machine with::
 
     python -m self_balancing_robot.render models/runs/<run>/videos/*.npz
@@ -25,6 +26,9 @@ import numpy as np
 
 from self_balancing_robot.config import DEFAULT_ENVIRONMENT_CONFIG, EnvironmentConfig
 from self_balancing_robot.envs.balance_env import load_model
+
+# Where scripts/setup_osmesa.sh extracts OSMesa on machines without it (no sudo).
+OSMESA_ROOT = Path(__file__).resolve().parents[2] / ".mujoco-osmesa" / "root"
 
 
 def tracking_camera(model: mujoco.MjModel, cfg: EnvironmentConfig) -> mujoco.MjvCamera:
@@ -58,6 +62,20 @@ def render_frames(
             renderer.update_scene(data, camera=camera)
             frames.append(renderer.render())
     return frames
+
+
+def backend_environment(backend: str) -> dict[str, str]:
+    """Environment of a render child process using the OpenGL `backend`."""
+    env = {**os.environ, "MUJOCO_GL": backend, "JAX_PLATFORMS": "cpu"}
+    if backend in ("egl", "osmesa"):
+        env["PYOPENGL_PLATFORM"] = backend
+    if backend == "osmesa" and OSMESA_ROOT.is_dir():
+        # The dynamic loader reads LD_LIBRARY_PATH at start-up, so it only works for a child.
+        directories = sorted({str(path.parent) for path in OSMESA_ROOT.rglob("*.so*")})
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [*directories, *filter(None, [os.environ.get("LD_LIBRARY_PATH")])]
+        )
+    return env
 
 
 def save_states(path: Path, trace: dict, model_file: str, fps: int) -> None:
@@ -111,7 +129,7 @@ class BackgroundRenderer:
                 backend = self.backends[0]
                 result = subprocess.run(
                     [sys.executable, "-m", "self_balancing_robot.render", str(states)],
-                    env={**os.environ, "MUJOCO_GL": backend, "JAX_PLATFORMS": "cpu"},
+                    env=backend_environment(backend),
                     check=False,
                     capture_output=True,
                     text=True,

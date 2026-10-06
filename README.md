@@ -60,7 +60,7 @@ scripts/train_gpu1.sh                      # or e.g. --timesteps 300000000, --re
 tail -f models/runs/<run>/train.log
 ```
 
-The script installs the environment on first use (with `uv` if available, which also uses the exact versions of `uv.lock`; otherwise pip), checks that JAX sees the GPU, and runs training under `nohup`, so closing the browser tab does not stop it. JAX allocates GPU memory as needed (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) since the GPU may be shared. If the hub shuts the server down, training stops with it: continue from the last checkpoint with `--resume`. Copy a finished run (or just its `params.pkl` and `curriculum.json`) back to evaluate, drive or export it locally. Training uses one GPU.
+The script installs the environment on first use (with `uv` if available, which also uses the exact versions of `uv.lock`; otherwise pip), checks that JAX sees the GPU, downloads OSMesa (software OpenGL for the videos, needed where EGL does not work, e.g. on the cluster) into `.mujoco-osmesa/` without sudo with `scripts/setup_osmesa.sh`, and runs training under `nohup`, so closing the browser tab does not stop it. JAX allocates GPU memory as needed (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) since the GPU may be shared. If the hub shuts the server down, training stops with it: continue from the last checkpoint with `--resume`. Copy a finished run (or just its `params.pkl` and `curriculum.json`) back to evaluate, drive or export it locally. Training uses one GPU.
 
 ## Evaluation, driving and export
 

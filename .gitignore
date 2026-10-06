@@ -154,6 +154,8 @@ activemq-data/
 .envrc
 .venv
 .venv-*/
+# OSMesa extracted by scripts/setup_osmesa.sh
+.mujoco-osmesa/
 env/
 venv/
 ENV/

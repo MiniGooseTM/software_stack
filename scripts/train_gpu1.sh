@@ -21,6 +21,9 @@ else
 fi
 "$VENV/bin/python" -c "import jax; d = jax.devices()[0]; assert d.platform == 'gpu', d; print('GPU:', d.device_kind)"
 
+# Software OpenGL for the videos, in case EGL does not work here (no sudo needed).
+scripts/setup_osmesa.sh || echo "OSMesa setup failed; videos may not be rendered"
+
 # The GPU may be shared: allocate memory as needed instead of 75% of it up front.
 export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
 
