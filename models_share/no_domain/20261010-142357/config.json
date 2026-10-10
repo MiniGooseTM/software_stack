@@ -1,0 +1,189 @@
+{
+  "args": {
+    "timesteps": 200000000,
+    "num_envs": 4096,
+    "seed": 7,
+    "run_dir": null,
+    "eval_freq": 5000000,
+    "resume": null,
+    "start_stage": null
+  },
+  "resumed_from": null,
+  "curriculum": [
+    {
+      "name": "balance",
+      "command_max": [
+        0.0,
+        0.0
+      ],
+      "reversal_probability": 0.0,
+      "slope_max": 0.0,
+      "push_max": 0.0,
+      "push_interval_s": [
+        2.0,
+        4.0
+      ],
+      "push_duration_s": 0.1,
+      "com_offset_max": 0.0,
+      "mass_fraction": 0.0,
+      "friction_fraction": 0.0,
+      "max_latency_steps": 0,
+      "imu_angle_noise": 0.0,
+      "imu_rate_noise": 0.0,
+      "encoder_noise": 0.0,
+      "zero_probability": 0.1,
+      "frontier_probability": 0.4,
+      "min_episodes": 0,
+      "success_rate": 0.95,
+      "speed_ratio": null,
+      "still_speed_limit": null,
+      "reversal_success_rate": null
+    },
+    {
+      "name": "commands 0.1 m/s",
+      "command_max": [
+        0.1,
+        0.5
+      ],
+      "reversal_probability": 0.2,
+      "slope_max": 0.0,
+      "push_max": 0.0,
+      "push_interval_s": [
+        2.0,
+        4.0
+      ],
+      "push_duration_s": 0.1,
+      "com_offset_max": 0.0,
+      "mass_fraction": 0.0,
+      "friction_fraction": 0.0,
+      "max_latency_steps": 0,
+      "imu_angle_noise": 0.0,
+      "imu_rate_noise": 0.0,
+      "encoder_noise": 0.0,
+      "zero_probability": 0.1,
+      "frontier_probability": 0.4,
+      "min_episodes": 2000,
+      "success_rate": 0.95,
+      "speed_ratio": 0.9,
+      "still_speed_limit": 0.02,
+      "reversal_success_rate": 0.85
+    },
+    {
+      "name": "commands 0.2 m/s",
+      "command_max": [
+        0.2,
+        1.0
+      ],
+      "reversal_probability": 0.2,
+      "slope_max": 0.0,
+      "push_max": 0.0,
+      "push_interval_s": [
+        2.0,
+        4.0
+      ],
+      "push_duration_s": 0.1,
+      "com_offset_max": 0.0,
+      "mass_fraction": 0.0,
+      "friction_fraction": 0.0,
+      "max_latency_steps": 0,
+      "imu_angle_noise": 0.0,
+      "imu_rate_noise": 0.0,
+      "encoder_noise": 0.0,
+      "zero_probability": 0.1,
+      "frontier_probability": 0.4,
+      "min_episodes": 2000,
+      "success_rate": 0.95,
+      "speed_ratio": 0.9,
+      "still_speed_limit": 0.02,
+      "reversal_success_rate": 0.85
+    },
+    {
+      "name": "commands 0.3 m/s",
+      "command_max": [
+        0.3,
+        1.5
+      ],
+      "reversal_probability": 0.2,
+      "slope_max": 0.0,
+      "push_max": 0.0,
+      "push_interval_s": [
+        2.0,
+        4.0
+      ],
+      "push_duration_s": 0.1,
+      "com_offset_max": 0.0,
+      "mass_fraction": 0.0,
+      "friction_fraction": 0.0,
+      "max_latency_steps": 0,
+      "imu_angle_noise": 0.0,
+      "imu_rate_noise": 0.0,
+      "encoder_noise": 0.0,
+      "zero_probability": 0.1,
+      "frontier_probability": 0.4,
+      "min_episodes": 2000,
+      "success_rate": 0.95,
+      "speed_ratio": 0.9,
+      "still_speed_limit": 0.02,
+      "reversal_success_rate": 0.85
+    }
+  ],
+  "DEFAULT_ENVIRONMENT_CONFIG": {
+    "model_file": "env_v0.xml",
+    "control_period_s": 0.01,
+    "solver_iterations": 4,
+    "solver_ls_iterations": 8,
+    "max_episode_steps": 1000,
+    "history_length": 8,
+    "initial_state_noise": 0.02,
+    "initial_pitch_radians": 0.1,
+    "upright_limit_radians": 0.6,
+    "yaw_rate_limit_rad_s": 3.0,
+    "camera_distance_m": 0.8,
+    "camera_elevation_degrees": -20.0,
+    "camera_azimuth_degrees": 45.0
+  },
+  "DEFAULT_POLICY_CONFIG": {
+    "actor_layers": [
+      128,
+      64,
+      32
+    ],
+    "critic_layers": [
+      128,
+      64
+    ],
+    "init_noise_std": 0.6065
+  },
+  "DEFAULT_REWARD_CONFIG": {
+    "alive_weight": 2.0,
+    "pitch_rate_weight": 0.1,
+    "linear_velocity_weight": 2.0,
+    "angular_velocity_weight": 1.0,
+    "action_weight": 0.01,
+    "smoothness_weight": 0.5,
+    "linear_velocity_variance": 0.005,
+    "linear_velocity_wide_variance": 0.25,
+    "linear_velocity_wide_fraction": 0.5,
+    "angular_velocity_variance": 0.3
+  },
+  "DEFAULT_TRAINING_CONFIG": {
+    "total_timesteps": 200000000,
+    "num_envs": 4096,
+    "unroll_length": 32,
+    "num_minibatches": 16,
+    "num_updates_per_batch": 4,
+    "learning_rate": 0.0003,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "entropy_cost": 0.01,
+    "max_grad_norm": 1.0,
+    "seed": 7,
+    "run_dir": "models/runs",
+    "evaluation_frequency": 5000000,
+    "evaluation_episodes": 32,
+    "evaluation_max_steps": 1000,
+    "evaluation_seed_offset": 1000000,
+    "log_dir": "logs"
+  }
+}
