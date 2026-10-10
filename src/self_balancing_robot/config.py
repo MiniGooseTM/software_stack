@@ -49,7 +49,7 @@ class EnvironmentConfig:
     # it, PPO on the GPU sometimes learned to balance while spinning in place at ~8 rad/s
     # (early on, spinning kept a barely trained robot up for longer), and the narrow yaw-rate
     # kernel gives no gradient back from that far away.
-    yaw_rate_limit_rad_s: float = 3.0
+    yaw_rate_limit_rad_s: float = 6.0
     camera_distance_m: float = 0.8
     camera_elevation_degrees: float = -20.0
     camera_azimuth_degrees: float = 45.0

@@ -27,8 +27,9 @@ import numpy as np
 # `SelfBalancingRobotEnv.wheel_feasible_command`). Up to v8 it was 0.4 m/s (~30% motor torque
 # left for balancing; 0.5 m/s left ~14% and v4 fell more). 0.3 m/s leaves headroom for the
 # speed bias a CoM shift causes: v8 with +1 cm drove ~0.15 m/s too fast, saturated the
-# motors at 0.4 m/s and fell.
-FULL_COMMAND = (0.3, 1.5)
+# motors at 0.4 m/s and fell. Limits test: 0.5 m/s and 3.0 rad/s, close to the goose robot's
+# no-load wheel speed (19.4 rad/s * 27.5 mm = 0.53 m/s).
+FULL_COMMAND = (0.5, 3.0)
 # Commands are redrawn every 3 to 5 s. A reversal (see `Stage.reversal_probability`) goes to
 # the opposite direction at this fraction to 100% of the stage's speed limit, no turning.
 COMMAND_RESAMPLE_S = (3.0, 5.0)
@@ -98,7 +99,7 @@ class Stage:
 # Learn to balance: zero command, flat ground, nominal physics, perfect sensors.
 BALANCE = Stage(name="balance", success_rate=0.95)
 
-# Learn to follow commands, the range growing in steps of 0.1 m/s (and 0.5 rad/s). Two fixed
+# Learn to follow commands, the range growing in steps of 0.1 m/s (and 0.6 rad/s). Two fixed
 # ranges (0.05, then 0.4 m/s) let v5/v6 pass the first barely moving (~20% of the command)
 # and the second had to unlearn it. The first step stays at 0.1 m/s: starting from 0.05 m/s,
 # v7 never passed it, as at 0.05 m/s the speed signal is lost in balancing wobble and gearbox
@@ -109,7 +110,7 @@ BALANCE = Stage(name="balance", success_rate=0.95)
 COMMANDS_1 = replace(
     BALANCE,
     name="commands 0.1 m/s",
-    command_max=(0.1, 0.5),
+    command_max=(0.1, 0.6),
     reversal_probability=0.2,
     min_episodes=2_000,
     success_rate=0.95,
@@ -117,8 +118,10 @@ COMMANDS_1 = replace(
     still_speed_limit=0.02,
     reversal_success_rate=0.85,
 )
-COMMANDS_2 = replace(COMMANDS_1, name="commands 0.2 m/s", command_max=(0.2, 1.0))
-COMMANDS_3 = replace(COMMANDS_2, name="commands 0.3 m/s", command_max=FULL_COMMAND)
+COMMANDS_2 = replace(COMMANDS_1, name="commands 0.2 m/s", command_max=(0.2, 1.2))
+COMMANDS_3 = replace(COMMANDS_2, name="commands 0.3 m/s", command_max=(0.3, 1.8))
+COMMANDS_4 = replace(COMMANDS_3, name="commands 0.4 m/s", command_max=(0.4, 2.4))
+COMMANDS_5 = replace(COMMANDS_4, name="commands 0.5 m/s", command_max=FULL_COMMAND)
 
 # Full commands on an imperfect world. Mass, friction, latency and noise are on from the first
 # step; slope, pushes and the CoM shift grow in six equal steps up to 0.3 rad, 1 N and 8 mm.
@@ -131,7 +134,7 @@ COMMANDS_3 = replace(COMMANDS_2, name="commands 0.3 m/s", command_max=FULL_COMMA
 #   ratio is a bit lower; v6 (85% survival, no speed check) drifted back to ~70% of the
 #   command. Standing still on slopes: v4 and v6 drifted at 0.07-0.10 m/s.
 RANDOMIZATION_1 = replace(
-    COMMANDS_3,
+    COMMANDS_5,
     name="randomization 1/6",
     slope_max=0.05,
     push_max=1.0 / 6,
@@ -188,6 +191,8 @@ CURRICULUM: tuple[Stage, ...] = (
     COMMANDS_1,
     COMMANDS_2,
     COMMANDS_3,
+    COMMANDS_4,
+    COMMANDS_5,
     RANDOMIZATION_1,
     RANDOMIZATION_2,
     RANDOMIZATION_3,

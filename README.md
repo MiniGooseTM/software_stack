@@ -68,9 +68,9 @@ The script installs the environment on first use (with `uv` if available, which 
 
 To drive a trained policy yourself, run `make teleop`. It simulates the last curriculum stage (noise, latency,
 slopes and random pushes); `make teleop TELEOP_ARGS='--stage "commands 0.3 m/s"'` gives a clean simulation. A window opens with a camera behind and above the robot: hold the
-arrow keys to drive and turn, `+`/`-` change the speed limit (starts at 100% = 0.3 m/s and 1.5 rad/s, the
+arrow keys to drive and turn, `+`/`-` change the speed limit (starts at 100% = 0.5 m/s and 3.0 rad/s, the
 training range; like in training, speed and turn rate are scaled down together when the outer wheel
-would need more than 0.3 m/s, so the ESP32 should limit joystick commands the same way), `V` cycles the camera (chase, top-down, side, free mouse view), Backspace
+would need more than 0.5 m/s, so the ESP32 should limit joystick commands the same way), `V` cycles the camera (chase, top-down, side, free mouse view), Backspace
 resets, and Esc quits. To test robustness, press a key, type a number and Enter: `G` slope in rad
 (the robot is placed on the new slope), `F` floor friction coefficient, `X` / `Y` / `Z` centre-of-mass
 offset in mm (axle, forward, up). `N` restores nominal physics. The bottom-left panel shows the current

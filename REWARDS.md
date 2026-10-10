@@ -66,18 +66,20 @@ The reward function remains identical across all stages. The curriculum only cha
 
 **Reversals.** Where a stage sets `reversal_probability` (20% from the first command stage on), each command change during an episode is, with that probability, a full reversal instead: the opposite direction of the current command at 75–100% of the stage's speed limit, with no turning. With random commands only 0.3–0.6% of changes were full reversals, and v9 fell on most joystick flips (+0.3 → −0.3 m/s) because it braked so hard it pitched to ~30°, past the ~29° where the base touches the ground.
 
-**Commands the wheels can deliver.** Every command is scaled down (speed and turn rate together) so that the outer wheel needs at most the full command speed of 0.3 m/s: $|v_{cmd}| + |\omega_{cmd}| \cdot b/2 \le 0.3$ m/s with half track $b/2 = 5.35$ cm (`goose.xml`; 6.45 cm on the earlier `XML-test.xml`). At 0.4 m/s and 1.5 rad/s the outer wheel would need ~0.5 m/s, more than the motors give while balancing; every v4 fall on flat ground came from such commands. The robot's joystick code must apply the same limit.
+**Commands the wheels can deliver.** Every command is scaled down (speed and turn rate together) so that the outer wheel needs at most the full command speed of 0.5 m/s: $|v_{cmd}| + |\omega_{cmd}| \cdot b/2 \le 0.5$ m/s with half track $b/2 = 5.35$ cm (`goose.xml`; 6.45 cm on the earlier `XML-test.xml`). At 0.4 m/s and 1.5 rad/s the outer wheel would need ~0.5 m/s, more than the motors give while balancing; every v4 fall on flat ground came from such commands. The robot's joystick code must apply the same limit.
 
 ### The default stages
 
 | # | Stage | What is new | Test to leave it |
 |---|---|---|---|
 | 0 | `balance` | Zero command, flat ground, nominal physics, perfect sensors | 95% survive |
-| 1 | `commands 0.1 m/s` | $\|v_{cmd}\| \le 0.1$ m/s, $\|\omega_{cmd}\| \le 0.5$ rad/s, 20% reversals | 2,000 episodes, 95% survive, speed ratio 0.90, still within 0.02 m/s, 85% of reversals survive |
-| 2 | `commands 0.2 m/s` | up to 0.2 m/s, 1.0 rad/s | as stage 1 |
-| 3 | `commands 0.3 m/s` | full range: 0.3 m/s, 1.5 rad/s | as stage 1 |
-| 4 | `randomization 1/6` | mass ±10%, friction ±40%, 0–2 steps of motor/IMU/encoder latency, sensor noise; slope 0.05 rad, push 1/6 N, CoM shift 1.3 mm | 5,000 episodes, 90% survive, speed ratio 0.85, still within 0.05 m/s, 85% of reversals survive |
-| 5–9 | `randomization 2/6` … `6/6` | slope, push and CoM shift up by 1/6 each, to 0.3 rad, 1 N, 8 mm | as stage 4 |
+| 1 | `commands 0.1 m/s` | $\|v_{cmd}\| \le 0.1$ m/s, $\|\omega_{cmd}\| \le 0.6$ rad/s, 20% reversals | 2,000 episodes, 95% survive, speed ratio 0.90, still within 0.02 m/s, 85% of reversals survive |
+| 2 | `commands 0.2 m/s` | up to 0.2 m/s, 1.2 rad/s | as stage 1 |
+| 3 | `commands 0.3 m/s` | up to 0.3 m/s, 1.8 rad/s | as stage 1 |
+| 4 | `commands 0.4 m/s` | up to 0.4 m/s, 2.4 rad/s | as stage 1 |
+| 5 | `commands 0.5 m/s` | full range: 0.5 m/s, 3.0 rad/s | as stage 1 |
+| 6 | `randomization 1/6` | mass ±10%, friction ±40%, 0–2 steps of motor/IMU/encoder latency, sensor noise; slope 0.05 rad, push 1/6 N, CoM shift 1.3 mm | 5,000 episodes, 90% survive, speed ratio 0.85, still within 0.05 m/s, 85% of reversals survive |
+| 7–11 | `randomization 2/6` … `6/6` | slope, push and CoM shift up by 1/6 each, to 0.3 rad, 1 N, 8 mm | as stage 6 |
 
 *   **Balance:** the robot learns to balance the inverted pendulum. Because $v_{cmd} = 0$, the $r_v$ tracking reward acts as a strict anti-drift penalty, keeping the robot hovering in its starting location.
 *   **Commands:** the robot learns to start, brake and reverse, then aggressive acceleration and cornering, never more than one step beyond what it already masters. Commands are resampled every 3 to 5 seconds. Earlier versions had two fixed command steps (±0.05 m/s, then ±0.4 m/s): v5 and v6 passed the first by barely moving (~20% of the commanded speed) and the second had to unlearn it. A first try with 8 steps from 0.05 m/s never passed the first: at 0.05 m/s the speed signal is lost in balancing wobble and gearbox friction, and the policy drifted back to standing still (36% → 4% of the command from 3M to 5M steps). Up to v8 the range was 0.4 m/s (about 30% of the motor torque left for balancing; at 0.5 m/s only ~14%, and v4 fell more often); 0.3 m/s leaves headroom for the speed bias of a CoM shift: v8 with +1 cm drove ~0.15 m/s too fast, saturated the motors and fell. The network tilts as much as it needs to track the speed; only the rate of pitching is penalized. (v4, the best speed tracker so far, scored 0.83 at the full range.)

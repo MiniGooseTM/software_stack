@@ -23,7 +23,7 @@ Used exclusively during simulation training. It is fully Markovian (no history w
 Used by the ESP32 to infer the privileged variables implicitly. 
 *   **Base Observation:** 11 states, in this order (`ACTOR_FRAME_FIELDS` in `envs/balance_env.py`):
     $[v_{x,cmd}, \omega_{z,cmd}, roll, pitch, \dot{roll}, \dot{pitch}, \dot{yaw}, \omega_{L}, \omega_{R}, a_{L,t-1}, a_{R,t-1}]$.
-    Commands divided by the full command range ($v_{x,cmd} / 0.3$ m/s, $\omega_{z,cmd} / 1.5$ rad/s, so in $[-1, 1]$; the joystick command must first be limited so the outer wheel needs at most 0.3 m/s, as in training), angles in rad (IMU attitude estimate), rates in rad/s (gyro, body frame), wheel velocities divided by the motor no-load speed (19.4 rad/s), and $a_{t-1}$ is the policy's own previous output.
+    Commands divided by the full command range ($v_{x,cmd} / 0.5$ m/s, $\omega_{z,cmd} / 3.0$ rad/s, so in $[-1, 1]$; the joystick command must first be limited so the outer wheel needs at most 0.5 m/s, as in training), angles in rad (IMU attitude estimate), rates in rad/s (gyro, body frame), wheel velocities divided by the motor no-load speed (19.4 rad/s), and $a_{t-1}$ is the policy's own previous output.
 *   **Temporal Window:** $H = 8$ frames (`EnvironmentConfig.history_length`, keep within 5 to 10).
 *   **Input Vector:** Concatenated history $[O_t, O_{t-1}, ..., O_{t-H+1}]$, newest first, resulting in an input size of $11 \times H = 88$. At startup the window is filled with copies of the first frame.
 
@@ -118,8 +118,8 @@ One frame, in this order (`ACTOR_FRAME_FIELDS` in `envs/balance_env.py`):
 
 | # | Field | Scaling |
 |---|---|---|
-| 0 | `v_cmd` | divided by 0.3 m/s |
-| 1 | `omega_cmd` | divided by 1.5 rad/s |
+| 0 | `v_cmd` | divided by 0.5 m/s |
+| 1 | `omega_cmd` | divided by 3.0 rad/s |
 | 2 | `roll` | rad |
 | 3 | `pitch` | rad |
 | 4 | `roll_rate` | rad/s |
@@ -138,9 +138,9 @@ One frame, in this order (`ACTOR_FRAME_FIELDS` in `envs/balance_env.py`):
 
 ### 4.5 Joystick Commands
 Apply the same limits as training before scaling:
-1. Clamp `v_cmd` to +-0.3 m/s and `omega_cmd` to +-1.5 rad/s.
-2. Keep the outer wheel within 0.3 m/s: if `|v| + |omega| * 0.0645 > 0.3` (half track 6.45 cm), multiply **both** by `0.3 / (|v| + |omega| * 0.0645)`.
-3. Divide by 0.3 and 1.5 for the frame.
+1. Clamp `v_cmd` to +-0.5 m/s and `omega_cmd` to +-3.0 rad/s.
+2. Keep the outer wheel within 0.5 m/s: if `|v| + |omega| * 0.0535 > 0.5` (half track 5.35 cm), multiply **both** by `0.5 / (|v| + |omega| * 0.0535)`.
+3. Divide by 0.5 and 3.0 for the frame.
 
 Instant full reversals (+0.3 -> -0.3 m/s) are part of training (v10), so no ramp is required. A slew-rate limit (e.g. 0.6 m/s^2) is still a cheap extra safety margin.
 
