@@ -76,6 +76,10 @@ PRIVILEGED_FIELDS = (
     "friction_deviation",
     "push_force_forward",
     "push_force_lateral",
+    "wheel_torque_left",
+    "wheel_torque_right",
+    "wheel_kick_left",
+    "wheel_kick_right",
     "motor_latency",
     "imu_latency",
     "encoder_latency",
@@ -212,6 +216,8 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             "mass": float(table["mass_fraction"].max()),
             "friction": float(table["friction_fraction"].max()),
             "push": float(table["push_max"].max()),
+            "wheel_torque": float(table["wheel_torque_max"].max()),
+            "wheel_kick": float(table["wheel_kick_max"].max()),
             "slope": float(np.sin(table["slope_max"].max())),
             "latency": float(max(self._max_latency, 1)),
         }
@@ -334,10 +340,15 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         use_frontier = (draw < zero_probability + frontier_probability) | (floor <= 0.0)
         return jnp.where(draw < zero_probability, 0.0, jnp.where(use_frontier, frontier, below))
 
-    def _sample_banded(self, rng: jax.Array, params: dict, quantity: str, signed: bool = True):
-        """Draw `quantity` (command, slope, push, com_offset) of a stage, with a random sign."""
+    def _sample_banded(
+        self, rng: jax.Array, params: dict, quantity: str, signed: bool = True, shape=None
+    ):
+        """Draw `quantity` (a key of `BANDED`) of a stage, with a random sign; `shape` draws
+        independent copies of a scalar quantity (e.g. one per wheel)."""
         maximum = params[BANDED[quantity]]
         floor = params[f"{quantity}_floor"]
+        if shape is not None:
+            maximum, floor = jnp.broadcast_to(maximum, shape), jnp.broadcast_to(floor, shape)
         keys = jax.random.split(rng, maximum.size + 1)
         magnitude = jax.vmap(
             lambda key, lo, hi: self.sample_magnitude(
@@ -368,8 +379,9 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """New (command, time until the next one, whether it is a reversal).
 
-        Speed and yaw rate are drawn with the stage's band sampling; mid-episode, a change is
-        a reversal with the stage's `reversal_probability`.
+        Speed and yaw rate are drawn with the stage's band sampling, or both 0 with the
+        stage's `stop_probability`; mid-episode, a change is a reversal with the stage's
+        `reversal_probability`.
         """
         keys = jax.random.split(rng, 6)
         params = self.stage_params(info["stage"])
@@ -390,6 +402,8 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         random_command = self.wheel_feasible_command(
             *self._sample_banded(keys[3], params, "command")
         )
+        stop = jax.random.uniform(keys[5]) < params["stop_probability"]
+        random_command = jnp.where(stop, 0.0, random_command)
         command = jnp.where(reversal, reversal_command, random_command)
         duration = jax.random.uniform(
             keys[4], minval=COMMAND_RESAMPLE_S[0], maxval=COMMAND_RESAMPLE_S[1]
@@ -506,6 +520,8 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
                         _normalized(info["push_force"] @ lateral, scale["push"]),
                     ]
                 ),
+                _normalized(info["wheel_torque"], scale["wheel_torque"]),
+                _normalized(info["wheel_kick"], scale["wheel_kick"]),
                 latencies / scale["latency"],
                 _normalized(
                     jnp.stack([info["ground_normal"][:2] @ forward, info["ground_normal"][:2] @ lateral]),
@@ -555,6 +571,7 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             jax.random.randint(key, (), 0, params["max_latency_steps"] + 1) for key in keys[3:6]
         ]
         slope = self._sample_banded(keys[6], params, "slope")
+        wheel_torque = self._sample_banded(keys[15], params, "wheel_torque", shape=(2,))
         slope_axis_angle = jax.random.uniform(keys[7], minval=-jnp.pi, maxval=jnp.pi)
 
         pinned_slope = ~jnp.isnan(persistent["override_slope"])
@@ -628,6 +645,14 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             "next_impulse_time": jax.random.uniform(
                 keys[12], minval=params["push_interval_s"][0], maxval=params["push_interval_s"][1]
             ),
+            "wheel_torque": wheel_torque,
+            "wheel_kick": jnp.zeros(2),
+            "wheel_kick_end_time": jnp.float32(0.0),
+            "next_wheel_kick_time": jax.random.uniform(
+                keys[16],
+                minval=params["wheel_kick_interval_s"][0],
+                maxval=params["wheel_kick_interval_s"][1],
+            ),
             # Sums for the stage's test: (speed reached along the command, commanded speed, |v| on zero
             # speed commands, steps on zero speed commands).
             "episode_tracking": jnp.zeros(4),
@@ -653,35 +678,49 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
 
     # ------------------------------------------------------------------ step
 
-    def _update_disturbance(self, info: dict, rng: jax.Array) -> dict:
-        """Random pushes on the base (if the stage has any), as a force in the world xy-plane."""
+    def _pulse(
+        self, info: dict, rng: jax.Array, value, keys: tuple[str, str, str], timing: str
+    ) -> dict:
+        """Advance one kind of random pulse, stored in `info` under `keys` (value, end time,
+        next start time): `value` starts at the next start time if the stage has any
+        (`<timing>_max` > 0), lasts `<timing>_duration_s`, and the one after it follows
+        `<timing>_interval_s` later."""
         params = self.stage_params(info["stage"])
-        direction_key, magnitude_key, interval_key = jax.random.split(rng, 3)
+        value_key, end_key, next_key = keys
+        interval = params[f"{timing}_interval_s"]
         time = info["episode_step"] * self.dt
-        pushes = params["push_max"] > 0
-        start = pushes & (time >= info["next_impulse_time"])
+        enabled = params[f"{timing}_max"] > 0
+        start = enabled & (time >= info[next_key])
+        end_time = jnp.where(start, time + params[f"{timing}_duration_s"], info[end_key])
+        next_time = info[next_key] + jnp.where(
+            start, jax.random.uniform(rng, minval=interval[0], maxval=interval[1]), 0.0
+        )
+        current = jnp.where(start, value, info[value_key])
+        current = jnp.where((time >= end_time) | ~enabled, 0.0, current)
+        return {**info, value_key: current, end_key: end_time, next_key: next_time}
+
+    def _update_disturbance(self, info: dict, rng: jax.Array) -> dict:
+        """Random pushes on the base, as a force in the world xy-plane, and torque kicks on
+        the wheels (if the stage has any)."""
+        params = self.stage_params(info["stage"])
+        keys = jax.random.split(rng, 5)
+        direction_key, push_key, push_timing_key, kick_key, kick_timing_key = keys
         direction = jax.random.uniform(direction_key, minval=-jnp.pi, maxval=jnp.pi)
-        magnitude = self._sample_banded(magnitude_key, params, "push", signed=False)
-        push = jnp.where(
-            start, magnitude * jnp.stack([jnp.cos(direction), jnp.sin(direction)]), info["push_force"]
+        magnitude = self._sample_banded(push_key, params, "push", signed=False)
+        info = self._pulse(
+            info,
+            push_timing_key,
+            magnitude * jnp.stack([jnp.cos(direction), jnp.sin(direction)]),
+            ("push_force", "push_end_time", "next_impulse_time"),
+            "push",
         )
-        push_end = jnp.where(start, time + params["push_duration_s"], info["push_end_time"])
-        next_impulse = info["next_impulse_time"] + jnp.where(
-            start,
-            jax.random.uniform(
-                interval_key,
-                minval=params["push_interval_s"][0],
-                maxval=params["push_interval_s"][1],
-            ),
-            0.0,
+        return self._pulse(
+            info,
+            kick_timing_key,
+            self._sample_banded(kick_key, params, "wheel_kick", shape=(2,)),
+            ("wheel_kick", "wheel_kick_end_time", "next_wheel_kick_time"),
+            "wheel_kick",
         )
-        push = jnp.where((time >= push_end) | ~pushes, 0.0, push)
-        return {
-            **info,
-            "push_force": push,
-            "push_end_time": push_end,
-            "next_impulse_time": next_impulse,
-        }
 
     def _track_command(self, info: dict, forward_velocity: jax.Array) -> dict:
         """Accumulate the speed-ratio and standing-still sums of the stage's test."""
@@ -721,7 +760,12 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
 
         info = self._update_disturbance(info, push_key)
         xfrc = jnp.zeros((self._mj_model.nbody, 6)).at[self._base_body_id, :2].set(info["push_force"])
-        data = state.data.replace(xfrc_applied=xfrc)
+        # A torque on a wheel joint acts on the wheel and, reversed, on the base, like the
+        # motor: a motor or gearbox torque error.
+        qfrc = jnp.zeros(self._mj_model.nv).at[self._wheel_qvel].set(
+            info["wheel_torque"] + info["wheel_kick"]
+        )
+        data = state.data.replace(xfrc_applied=xfrc, qfrc_applied=qfrc)
         data = mjx_env.step(
             self._episode_model(info), data, applied_action * self._max_wheel_speed, self.n_substeps
         )

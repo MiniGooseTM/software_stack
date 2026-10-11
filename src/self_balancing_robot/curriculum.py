@@ -9,7 +9,8 @@ episodes, pooled over all parallel environments, passes the stage's test (see
 To add or change a stage, edit `CURRICULUM` below; nothing else needs to change. Each stage is
 written as the previous one plus what changes (`replace(previous, ...)`).
 
-Magnitudes (command speed and yaw rate, slope, push, CoM shift) are drawn per stage as: 0 with
+Magnitudes (command speed and yaw rate, slope, push, CoM shift, wheel torque offset and
+kicks) are drawn per stage as: 0 with
 `zero_probability` (stand still, flat ground, no push), in the band the stage added (from the
 previous stage's maximum up to this stage's) with `frontier_probability`, otherwise uniform
 below that band, so easier values keep being practised. If a stage does not raise a
@@ -58,6 +59,8 @@ class Stage:
     command_max: tuple[float, float] = (0.0, 0.0)
     # Chance that a command change mid-episode is a full reversal instead of a random command.
     reversal_probability: float = 0.0
+    # Chance that a command that is not a reversal is a full stop (0, 0): the released joystick.
+    stop_probability: float = 0.0
     # Terrain incline (rad), in a random direction.
     slope_max: float = 0.0
     # Pushes on the base (N, horizontal, random direction), lasting `push_duration_s`, one
@@ -65,6 +68,14 @@ class Stage:
     push_max: float = 0.0
     push_interval_s: tuple[float, float] = (2.0, 4.0)
     push_duration_s: float = 0.1
+    # Constant torque on each wheel for the whole episode (N m), left and right drawn
+    # independently: motor and gearbox mismatch and drag (unequal ones make it turn).
+    wheel_torque_max: float = 0.0
+    # Torque kicks on each wheel (N m), lasting `wheel_kick_duration_s`, one every
+    # `wheel_kick_interval_s`: bumps and stiction.
+    wheel_kick_max: float = 0.0
+    wheel_kick_interval_s: tuple[float, float] = (1.0, 3.0)
+    wheel_kick_duration_s: float = 0.05
     # Centre-of-mass shift per axis (m).
     com_offset_max: float = 0.0
     # Base mass and floor friction: uniform within +- this fraction of nominal.
@@ -105,23 +116,57 @@ BALANCE = Stage(name="balance", success_rate=0.95)
 # friction (36% -> 4% of the command from 3M to 5M steps). Reversals: with random commands
 # only 0.3-0.6% of changes were full reversals, and v9 fell on most joystick flips
 # (+0.3 -> -0.3 m/s), braking so hard it pitched to ~30 deg. The speed ratio replaced an
-# absolute error threshold that let v5 advance driving at ~60% of the command.
+# absolute error threshold that let v5 advance driving at ~60% of the command. Stops: with
+# speed and yaw rate each 0 at `zero_probability`, only ~1% of commands were (0, 0), the
+# most common command on the robot; v4 and v6 drifted standing still.
+# Sensor noise and latency grow alongside, in thirds: switched on together with everything
+# else at the first randomization stage (run 20261010-165211), survival there fell from
+# ~100% to 35% and the mean |pitch| rose from ~1 to 6.5 deg.
+IMU_ANGLE_NOISE = 0.01
+IMU_RATE_NOISE = 0.05
+ENCODER_NOISE = 0.3
 COMMANDS_1 = replace(
     BALANCE,
     name="commands 0.1 m/s",
     command_max=(0.1, 0.5),
     reversal_probability=0.2,
+    stop_probability=0.2,
+    imu_angle_noise=IMU_ANGLE_NOISE / 3,
+    imu_rate_noise=IMU_RATE_NOISE / 3,
+    encoder_noise=ENCODER_NOISE / 3,
     min_episodes=2_000,
     success_rate=0.95,
     speed_ratio=0.90,
     still_speed_limit=0.02,
     reversal_success_rate=0.85,
 )
-COMMANDS_2 = replace(COMMANDS_1, name="commands 0.2 m/s", command_max=(0.2, 1.0))
-COMMANDS_3 = replace(COMMANDS_2, name="commands 0.3 m/s", command_max=FULL_COMMAND)
+COMMANDS_2 = replace(
+    COMMANDS_1,
+    name="commands 0.2 m/s",
+    command_max=(0.2, 1.0),
+    max_latency_steps=1,
+    imu_angle_noise=IMU_ANGLE_NOISE * 2 / 3,
+    imu_rate_noise=IMU_RATE_NOISE * 2 / 3,
+    encoder_noise=ENCODER_NOISE * 2 / 3,
+)
+COMMANDS_3 = replace(
+    COMMANDS_2,
+    name="commands 0.3 m/s",
+    command_max=FULL_COMMAND,
+    max_latency_steps=2,
+    imu_angle_noise=IMU_ANGLE_NOISE,
+    imu_rate_noise=IMU_RATE_NOISE,
+    encoder_noise=ENCODER_NOISE,
+)
 
-# Full commands on an imperfect world. Mass, friction, latency and noise are on from the first
-# step; slope, pushes and the CoM shift grow in six equal steps up to 0.3 rad, 1 N and 8 mm.
+# Full commands on an imperfect world. Mass and friction are on from the first step (noise
+# and latency already are); slope, pushes, the CoM shift and the wheel torques grow in six
+# equal steps up to 0.3 rad, 0.5 N, 8 mm, 0.01 N m offset and 0.02 N m kicks.
+# - Pushes: the robot weighs 0.27 kg, so a 0.1 s push of 1 N (the maximum up to v9) gave it
+#   ~0.37 m/s, more than the full command and ~70% of the wheel no-load speed (~0.53 m/s);
+#   0.5 N gives ~0.19 m/s.
+# - Wheel torques, against the 0.109 N m stall torque per motor: the offset is ~9% (as much
+#   as the modelled gearbox friction), the kicks ~18%.
 # - Slopes: the base hits the ground at 0.5 rad of tilt relative to the surface, so above
 #   ~0.3 rad slopes cannot be driven straight up or down (v2: 0% survival above 0.3 rad).
 # - CoM: the nominal CoM is 4.9 cm above the axle. Up to v7 the shift was 4.9 mm from the
@@ -130,18 +175,20 @@ COMMANDS_3 = replace(COMMANDS_2, name="commands 0.3 m/s", command_max=FULL_COMMA
 # - Test: slopes cost speed uphill (at 0.3 rad, 0.4 m/s took almost full duty), so the speed
 #   ratio is a bit lower; v6 (85% survival, no speed check) drifted back to ~70% of the
 #   command. Standing still on slopes: v4 and v6 drifted at 0.07-0.10 m/s.
+PUSH_MAX = 0.5
+COM_OFFSET_MAX = 0.008
+WHEEL_TORQUE_MAX = 0.01
+WHEEL_KICK_MAX = 0.02
 RANDOMIZATION_1 = replace(
     COMMANDS_3,
     name="randomization 1/6",
     slope_max=0.05,
-    push_max=1.0 / 6,
-    com_offset_max=0.008 / 6,
+    push_max=PUSH_MAX / 6,
+    com_offset_max=COM_OFFSET_MAX / 6,
+    wheel_torque_max=WHEEL_TORQUE_MAX / 6,
+    wheel_kick_max=WHEEL_KICK_MAX / 6,
     mass_fraction=0.10,
     friction_fraction=0.40,
-    max_latency_steps=2,
-    imu_angle_noise=0.01,
-    imu_rate_noise=0.05,
-    encoder_noise=0.3,
     min_episodes=5_000,
     success_rate=0.90,
     speed_ratio=0.85,
@@ -151,36 +198,46 @@ RANDOMIZATION_2 = replace(
     RANDOMIZATION_1,
     name="randomization 2/6",
     slope_max=0.10,
-    push_max=2.0 / 6,
-    com_offset_max=0.008 * 2 / 6,
+    push_max=PUSH_MAX * 2 / 6,
+    com_offset_max=COM_OFFSET_MAX * 2 / 6,
+    wheel_torque_max=WHEEL_TORQUE_MAX * 2 / 6,
+    wheel_kick_max=WHEEL_KICK_MAX * 2 / 6,
 )
 RANDOMIZATION_3 = replace(
     RANDOMIZATION_2,
     name="randomization 3/6",
     slope_max=0.15,
-    push_max=3.0 / 6,
-    com_offset_max=0.008 * 3 / 6,
+    push_max=PUSH_MAX * 3 / 6,
+    com_offset_max=COM_OFFSET_MAX * 3 / 6,
+    wheel_torque_max=WHEEL_TORQUE_MAX * 3 / 6,
+    wheel_kick_max=WHEEL_KICK_MAX * 3 / 6,
 )
 RANDOMIZATION_4 = replace(
     RANDOMIZATION_3,
     name="randomization 4/6",
     slope_max=0.20,
-    push_max=4.0 / 6,
-    com_offset_max=0.008 * 4 / 6,
+    push_max=PUSH_MAX * 4 / 6,
+    com_offset_max=COM_OFFSET_MAX * 4 / 6,
+    wheel_torque_max=WHEEL_TORQUE_MAX * 4 / 6,
+    wheel_kick_max=WHEEL_KICK_MAX * 4 / 6,
 )
 RANDOMIZATION_5 = replace(
     RANDOMIZATION_4,
     name="randomization 5/6",
     slope_max=0.25,
-    push_max=5.0 / 6,
-    com_offset_max=0.008 * 5 / 6,
+    push_max=PUSH_MAX * 5 / 6,
+    com_offset_max=COM_OFFSET_MAX * 5 / 6,
+    wheel_torque_max=WHEEL_TORQUE_MAX * 5 / 6,
+    wheel_kick_max=WHEEL_KICK_MAX * 5 / 6,
 )
 RANDOMIZATION_6 = replace(
     RANDOMIZATION_5,
     name="randomization 6/6",
     slope_max=0.30,
-    push_max=1.0,
-    com_offset_max=0.008,
+    push_max=PUSH_MAX,
+    com_offset_max=COM_OFFSET_MAX,
+    wheel_torque_max=WHEEL_TORQUE_MAX,
+    wheel_kick_max=WHEEL_KICK_MAX,
 )
 
 CURRICULUM: tuple[Stage, ...] = (
@@ -205,6 +262,8 @@ BANDED = {
     "slope": "slope_max",
     "push": "push_max",
     "com_offset": "com_offset_max",
+    "wheel_torque": "wheel_torque_max",
+    "wheel_kick": "wheel_kick_max",
 }
 
 
@@ -224,13 +283,15 @@ def validate(curriculum: tuple[Stage, ...]) -> None:
                 raise ValueError(f"{stage.name}: {field.name} is negative")
         if stage.zero_probability + stage.frontier_probability > 1:
             raise ValueError(f"{stage.name}: zero + frontier probability is above 1")
-        probabilities = (stage.reversal_probability, stage.success_rate)
+        probabilities = (stage.reversal_probability, stage.stop_probability, stage.success_rate)
         if any(p > 1 for p in probabilities):
             raise ValueError(f"{stage.name}: a probability or rate is above 1")
         if any(c > full for c, full in zip(stage.command_max, FULL_COMMAND)):
             raise ValueError(f"{stage.name}: command_max is above FULL_COMMAND {FULL_COMMAND}")
-        if stage.push_interval_s[0] > stage.push_interval_s[1]:
-            raise ValueError(f"{stage.name}: push_interval_s must be (min, max)")
+        for field in ("push_interval_s", "wheel_kick_interval_s"):
+            low, high = getattr(stage, field)
+            if low > high:
+                raise ValueError(f"{stage.name}: {field} must be (min, max)")
 
 
 def stage_index(curriculum: tuple[Stage, ...], stage: str | int) -> int:
