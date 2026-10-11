@@ -177,9 +177,12 @@ def test_physics_is_randomized_only_where_the_stage_says_so(env):
         info = reset(env, seed=8, stage=stage).info
         assert info["mass_scale"] == 1.0 and info["friction_scale"] == 1.0
         assert np.all(info["com_offset"] == 0.0) and info["ground_normal"][2] == 1.0
-        assert info["motor_latency"] == 0
+        assert np.all(info["wheel_torque"] == 0.0)
+    assert reset(env, seed=8, stage="balance").info["motor_latency"] == 0
     info = reset(env, seed=8, stage=LAST).info
     assert info["mass_scale"] != 1.0 and info["friction_scale"] != 1.0
+    left, right = info["wheel_torque"]
+    assert left != 0.0 and right != 0.0 and left != right
     assert info["ground_normal"][2] < 1.0
     model = env._episode_model(info)
     base = env._base_body_id
@@ -207,10 +210,24 @@ def test_samples_stay_within_each_stages_maxima(env):
         assert np.all(np.abs(info["command"]) <= np.array(stage.command_max) + 1e-6), stage.name
         assert np.all(np.abs(info["slope"]) <= stage.slope_max + 1e-6), stage.name
         assert np.all(np.abs(info["com_offset"]) <= stage.com_offset_max + 1e-6), stage.name
+        assert info["wheel_torque"].shape == (50, 2), stage.name
+        assert np.all(np.abs(info["wheel_torque"]) <= stage.wheel_torque_max + 1e-6), stage.name
         assert np.all(np.abs(info["mass_scale"] - 1) <= stage.mass_fraction + 1e-6), stage.name
         assert np.all(info["motor_latency"] <= stage.max_latency_steps), stage.name
         if stage.command_max[0] > 0:  # the new band is actually reached
             assert np.abs(info["command"][:, 0]).max() > 0.5 * stage.command_max[0], stage.name
+
+
+def test_commands_are_full_stops_at_the_stop_probability(env):
+    stage = CURRICULUM[env.stage_index(COMMANDS_FULL)]
+    info = reset(env, seed=21, stage=COMMANDS_FULL).info
+    keys = jax.random.split(jax.random.PRNGKey(3), 4_000)
+    commands, _, reversals = jax.vmap(lambda key: env._sample_command(key, info, True))(keys)
+    stops = np.all(np.asarray(commands) == 0.0, axis=1)
+    # Plus ~1% from speed and yaw rate both drawing 0.
+    expected = (1 - stage.reversal_probability) * (stage.stop_probability + 0.01)
+    assert np.isclose(stops.mean(), expected, atol=0.02)
+    assert not np.any(stops & np.asarray(reversals))
 
 
 def test_reversals_flip_direction_near_full_speed(env):
@@ -269,6 +286,37 @@ def test_held_command_is_not_resampled(env):
 
     _, commands = jax.jit(lambda s: jax.lax.scan(body, s, None, int(6.0 / env.dt)))(state)
     np.testing.assert_allclose(commands, np.tile([0.2, -0.5], (len(commands), 1)), rtol=1e-6)
+
+
+def test_wheel_torques_act_on_the_wheel_joints(env):
+    """The episode's torque offset is applied all the time, a kick on top while it lasts."""
+    stage = CURRICULUM[LAST]
+    state = set_info(
+        reset(env, seed=4, stage=LAST),
+        wheel_torque=[0.004, -0.006],
+        next_wheel_kick_time=0.05,
+        next_impulse_time=1e3,
+    )
+    wheels = env._wheel_qvel
+    kicks = []
+    for _ in range(int(0.2 / env.dt)):
+        state = step(env, state)
+        assert not state.done
+        applied = state.data.qfrc_applied[wheels]
+        expected = np.array([0.004, -0.006]) + state.info["wheel_kick"]
+        np.testing.assert_allclose(applied, expected, atol=1e-7)
+        kicks.append(np.any(state.info["wheel_kick"] != 0.0))
+    # Steps 1-4 (t = 0..0.03 s) before the kick at 0.05 s, which lasts wheel_kick_duration_s.
+    assert not any(kicks[:5])
+    assert sum(kicks) == round(stage.wheel_kick_duration_s / env.dt)
+    assert state.info["next_wheel_kick_time"] >= 0.05 + stage.wheel_kick_interval_s[0]
+
+
+def test_wheel_kicks_only_where_the_stage_has_them(env):
+    state = set_info(reset(env, seed=4, stage=COMMANDS_FULL), next_wheel_kick_time=0.0)
+    state = step(env, state)
+    assert np.all(state.info["wheel_kick"] == 0.0)
+    assert np.all(state.data.qfrc_applied == 0.0)
 
 
 def test_physics_overrides_pin_friction_com_and_slope(env):

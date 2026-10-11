@@ -15,8 +15,8 @@ from self_balancing_robot.curriculum import (
 
 
 def test_default_curriculum_keeps_the_tuned_progression():
-    """The list reproduces the earlier stage/level curriculum: balance, commands in thirds of
-    the full range, then slope, push and CoM shift in sixths of their maxima."""
+    """Balance, commands in thirds of the full range (sensor noise and latency growing
+    alongside), then slope, push, CoM shift and wheel torques in sixths of their maxima."""
     names = [stage.name for stage in CURRICULUM]
     assert names[0] == "balance" and len(names) == 10
     commands = [stage.command_max for stage in CURRICULUM]
@@ -25,16 +25,25 @@ def test_default_curriculum_keeps_the_tuned_progression():
     randomized = CURRICULUM[4:]
     for k, stage in enumerate(randomized, start=1):
         assert np.isclose(stage.slope_max, k / 6 * 0.3)
-        assert np.isclose(stage.push_max, k / 6 * 1.0)
+        assert np.isclose(stage.push_max, k / 6 * 0.5)
         assert np.isclose(stage.com_offset_max, k / 6 * 0.008)
+        assert np.isclose(stage.wheel_torque_max, k / 6 * 0.01)
+        assert np.isclose(stage.wheel_kick_max, k / 6 * 0.02)
         assert (stage.mass_fraction, stage.friction_fraction) == (0.10, 0.40)
         assert stage.max_latency_steps == 2 and stage.imu_angle_noise > 0
         assert (stage.min_episodes, stage.success_rate, stage.speed_ratio) == (5_000, 0.90, 0.85)
         assert stage.still_speed_limit == 0.05 and stage.reversal_success_rate == 0.85
-    for stage in CURRICULUM[1:4]:
+    full_noise = CURRICULUM[-1].imu_angle_noise, CURRICULUM[-1].encoder_noise
+    for k, stage in enumerate(CURRICULUM[1:4], start=1):
         assert (stage.min_episodes, stage.success_rate, stage.speed_ratio) == (2_000, 0.95, 0.90)
         assert stage.still_speed_limit == 0.02 and stage.reversal_probability == 0.2
-        assert stage.slope_max == 0 and stage.mass_fraction == 0 and stage.imu_angle_noise == 0
+        assert stage.stop_probability == 0.2
+        assert stage.slope_max == 0 and stage.mass_fraction == 0 and stage.push_max == 0
+        assert stage.wheel_torque_max == 0 and stage.wheel_kick_max == 0
+        assert stage.max_latency_steps == k - 1
+        noise = stage.imu_angle_noise, stage.encoder_noise
+        np.testing.assert_allclose(noise, np.multiply(full_noise, k / 3))
+    assert BALANCE.imu_angle_noise == 0 and BALANCE.max_latency_steps == 0
     assert BALANCE.speed_ratio is None and BALANCE.command_max == (0.0, 0.0)
 
 
@@ -44,7 +53,8 @@ def test_band_floors_come_from_the_previous_stage():
     np.testing.assert_allclose(table["command_floor"][:5], [(0, 0), (0, 0), (0.1, 0.5), (0.2, 1.0), (0, 0)])
     assert np.all(table["command_floor"][4:] == 0)
     np.testing.assert_allclose(table["slope_floor"][4:], np.arange(6) / 6 * 0.3, atol=1e-6)
-    np.testing.assert_allclose(table["push_floor"][4:], np.arange(6) / 6, atol=1e-6)
+    np.testing.assert_allclose(table["push_floor"][4:], np.arange(6) / 6 * 0.5, atol=1e-6)
+    np.testing.assert_allclose(table["wheel_torque_floor"][4:], np.arange(6) / 6 * 0.01, atol=1e-6)
 
 
 def test_unchecked_criteria_always_pass_in_the_table():
@@ -75,6 +85,7 @@ def test_stages_are_found_by_name_or_index():
         ((replace(BALANCE, zero_probability=0.7, frontier_probability=0.5),), "above 1"),
         ((replace(BALANCE, command_max=(0.5, 1.0)),), "FULL_COMMAND"),
         ((replace(BALANCE, push_interval_s=(4.0, 2.0)),), "push_interval_s"),
+        ((replace(BALANCE, wheel_kick_interval_s=(3.0, 1.0)),), "wheel_kick_interval_s"),
     ],
 )
 def test_invalid_curricula_are_rejected(curriculum, message):
