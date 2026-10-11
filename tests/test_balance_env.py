@@ -108,6 +108,8 @@ def test_episode_trace_metrics_and_plots(tmp_path):
     trace = run_episode(env, _ZeroPolicy(), seed=11, max_steps=50)
     env.close()
     assert len(trace["time"]) == len(trace["v_cmd"]) == trace["action"].shape[0]
+    assert len(trace["position_x"]) == len(trace["position_y"]) == len(trace["time"])
+    assert trace["initial_position"].shape == (2,)
     assert trace["end"] in {"pitch_failure", "base_collision", "max_steps"}
     metrics = summarize(trace)
     assert set(metrics) == set(METRIC_KEYS)
@@ -121,6 +123,70 @@ def test_episode_trace_metrics_and_plots(tmp_path):
     plot_training_metrics(history, tmp_path / "training.png")
     for name in ("episode.png", "training.png"):
         assert (tmp_path / name).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_sensor_update_intervals_hold_samples_between_sensor_reads():
+    from self_balancing_robot.config import EnvironmentConfig
+
+    env = SelfBalancingRobotEnv(
+        environment_config=EnvironmentConfig(
+            imu_update_interval_steps=2,
+            encoder_update_interval_steps=3,
+        )
+    )
+    env.reset(seed=17)
+    imu_readings = iter((np.full(5, 1.0), np.full(5, 2.0)))
+    encoder_readings = iter((np.full(2, 3.0), np.full(2, 4.0)))
+    env._imu_measurement = lambda: next(imu_readings)
+    env._encoder_measurement = lambda: next(encoder_readings)
+
+    env._episode_step = 1
+    held = env._actor_frame()
+    np.testing.assert_allclose(held[2:7], env._held_imu_measurement)
+    np.testing.assert_allclose(held[7:9], env._held_encoder_measurement)
+
+    env._episode_step = 2
+    new_imu = env._actor_frame()
+    np.testing.assert_allclose(new_imu[2:7], np.full(5, 1.0))
+    np.testing.assert_allclose(new_imu[7:9], env._held_encoder_measurement)
+
+    env._episode_step = 3
+    new_encoders = env._actor_frame()
+    np.testing.assert_allclose(new_encoders[2:7], env._held_imu_measurement)
+    np.testing.assert_allclose(new_encoders[7:9], np.full(2, 3.0))
+    env.close()
+
+
+def test_sensor_noise_does_not_change_domain_randomization_rng():
+    from self_balancing_robot.config import EnvironmentConfig
+
+    full_rate = SelfBalancingRobotEnv(curriculum_stage=3)
+    reduced_rate = SelfBalancingRobotEnv(
+        curriculum_stage=3,
+        environment_config=EnvironmentConfig(
+            imu_update_interval_steps=4,
+            encoder_update_interval_steps=4,
+        ),
+    )
+    full_rate.reset(seed=29)
+    reduced_rate.reset(seed=29)
+    np.testing.assert_allclose(full_rate.command, reduced_rate.command)
+    for step in range(1, 12):
+        full_rate._episode_step = reduced_rate._episode_step = step
+        full_rate._actor_frame()
+        reduced_rate._actor_frame()
+    assert full_rate.np_random.random() == reduced_rate.np_random.random()
+    full_rate.close()
+    reduced_rate.close()
+
+
+def test_sensor_update_intervals_must_be_positive():
+    from self_balancing_robot.config import EnvironmentConfig
+
+    with pytest.raises(ValueError, match="Sensor update intervals"):
+        SelfBalancingRobotEnv(
+            environment_config=EnvironmentConfig(imu_update_interval_steps=0)
+        )
 
 
 def test_reward_components_follow_configured_weights():
@@ -227,6 +293,32 @@ def test_domain_randomization_changes_physics_only_in_stage_three():
     env.set_curriculum_stage(1)
     env.reset(seed=8)
     assert env.model.body_mass[env._base_body_id] == nominal_mass
+    env.close()
+
+
+def test_stage_three_keeps_commands_without_domain_randomization():
+    env = SelfBalancingRobotEnv(curriculum_stage=3, domain_randomization=False)
+    nominal_mass = env.model.body_mass[env._base_body_id]
+    env.reset(seed=18)
+
+    assert env.curriculum_stage == 3
+    np.testing.assert_allclose(env.command_limits, env.curriculum_config.command_limits)
+    assert env.model.body_mass[env._base_body_id] == nominal_mass
+    np.testing.assert_allclose(env._com_offset, np.zeros(3))
+    assert env._friction_scale == 1.0
+    assert (env._motor_latency, env._imu_latency, env._encoder_latency) == (0, 0, 0)
+    assert env.physics["slope"] == 0.0
+
+    class UnexpectedSensorNoise:
+        def normal(self, *args, **kwargs):
+            raise AssertionError("domain-randomization sensor noise should be disabled")
+
+    env._sensor_random = UnexpectedSensorNoise()
+    env._episode_step = 1
+    env._actor_frame()
+    env._next_impulse_time = 0.0
+    env._update_disturbance()
+    np.testing.assert_array_equal(env._push_force, np.zeros(2))
     env.close()
 
 

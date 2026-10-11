@@ -99,6 +99,7 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         environment_config: EnvironmentConfig | None = None,
         max_episode_steps: int | None = None,
         curriculum_stage: int = CurriculumStage.STABILIZATION,
+        domain_randomization: bool = True,
     ):
         gym.utils.EzPickle.__init__(
             self,
@@ -109,11 +110,18 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
             environment_config,
             max_episode_steps,
             curriculum_stage,
+            domain_randomization,
         )
         self.environment_config = environment_config or DEFAULT_ENVIRONMENT_CONFIG
+        if (
+            self.environment_config.imu_update_interval_steps < 1
+            or self.environment_config.encoder_update_interval_steps < 1
+        ):
+            raise ValueError("Sensor update intervals must be at least one control step")
         self.reward_config = reward_config or DEFAULT_REWARD_CONFIG
         self.curriculum_config = curriculum_config or DEFAULT_CURRICULUM_CONFIG
         self.randomization_config = randomization_config or DEFAULT_RANDOMIZATION_CONFIG
+        self.domain_randomization = domain_randomization
         self.max_episode_steps = (
             max_episode_steps
             if max_episode_steps is not None
@@ -201,6 +209,9 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         self._motor_latency = 0
         self._imu_latency = 0
         self._encoder_latency = 0
+        self._held_imu_measurement: np.ndarray | None = None
+        self._held_encoder_measurement: np.ndarray | None = None
+        self._sensor_random = np.random.default_rng()
         self._mass_scale = 1.0
         self._friction_scale = 1.0
         self._com_offset = np.zeros(3)
@@ -410,21 +421,32 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
 
     def _actor_frame(self) -> np.ndarray:
         """Delayed, noisy measurements as the onboard sensors would report them."""
+        if self._episode_step % self.environment_config.imu_update_interval_steps == 0:
+            self._held_imu_measurement = self._imu_measurement()
+            if self._uses_domain_randomization:
+                self._held_imu_measurement[:2] += self._sensor_random.normal(
+                    0.0, self.randomization_config.imu_angle_noise_rad, size=2
+                )
+                self._held_imu_measurement[2:] += self._sensor_random.normal(
+                    0.0, self.randomization_config.imu_rate_noise_rad_s, size=3
+                )
+        if self._episode_step % self.environment_config.encoder_update_interval_steps == 0:
+            self._held_encoder_measurement = self._encoder_measurement()
+            if self._uses_domain_randomization:
+                self._held_encoder_measurement += self._sensor_random.normal(
+                    0.0,
+                    self.randomization_config.encoder_velocity_noise_rad_s
+                    / self._max_wheel_speed,
+                    size=2,
+                )
         self._sensor_buffer.appendleft(
-            np.concatenate((self._imu_measurement(), self._encoder_measurement()))
+            np.concatenate((self._held_imu_measurement, self._held_encoder_measurement))
         )
         while len(self._sensor_buffer) > self._max_sensor_latency() + 1:
             self._sensor_buffer.pop()
         oldest = len(self._sensor_buffer) - 1
         imu = self._sensor_buffer[min(self._imu_latency, oldest)][:5].copy()
         encoders = self._sensor_buffer[min(self._encoder_latency, oldest)][5:].copy()
-        if self._stage >= CurriculumStage.DOMAIN_RANDOMIZATION:
-            cfg = self.randomization_config
-            imu[:2] += self.np_random.normal(0.0, cfg.imu_angle_noise_rad, size=2)
-            imu[2:] += self.np_random.normal(0.0, cfg.imu_rate_noise_rad_s, size=3)
-            encoders += self.np_random.normal(
-                0.0, cfg.encoder_velocity_noise_rad_s / self._max_wheel_speed, size=2
-            )
         return np.concatenate((self._scaled_command(), imu, encoders, self._previous_action))
 
     def _scaled_command(self) -> np.ndarray:
@@ -433,6 +455,10 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
     def _max_sensor_latency(self) -> int:
         cfg = self.randomization_config
         return max(cfg.max_imu_latency_steps, cfg.max_encoder_latency_steps)
+
+    @property
+    def _uses_domain_randomization(self) -> bool:
+        return self.domain_randomization and self._stage >= CurriculumStage.DOMAIN_RANDOMIZATION
 
     def _privileged_state(self) -> np.ndarray:
         cfg = self.randomization_config
@@ -497,7 +523,7 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
     def _sample_randomization(self) -> np.ndarray:
         """Randomize the model for stage 3 and return the ground orientation quaternion."""
         cfg = self.randomization_config
-        randomize = self._stage >= CurriculumStage.DOMAIN_RANDOMIZATION
+        randomize = self._uses_domain_randomization
         self._mass_scale = (
             self.np_random.uniform(1.0 - cfg.mass_fraction, 1.0 + cfg.mass_fraction)
             if randomize
@@ -564,6 +590,7 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         self.model.geom_friction[:, 0] *= self._friction_scale
 
     def reset_model(self) -> np.ndarray:
+        self._sensor_random = np.random.default_rng(int(self.np_random_seed) ^ 0x5EED5EED)
         ground_quat = self._sample_randomization()
         if not self._command_held:
             self._sample_command()
@@ -573,6 +600,8 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         self._previous_action[:] = 0.0
         self._action_queue.clear()
         self._sensor_buffer.clear()
+        self._held_imu_measurement = None
+        self._held_encoder_measurement = None
         self._history.clear()
         self._push_force[:] = 0.0
         self._push_end_time = 0.0
@@ -613,7 +642,7 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
 
     def _update_disturbance(self) -> None:
         self.data.xfrc_applied[self._base_body_id] = 0.0
-        if self._stage < CurriculumStage.DOMAIN_RANDOMIZATION:
+        if not self._uses_domain_randomization:
             return
         cfg = self.randomization_config
         time = self._episode_step * self.dt
@@ -745,6 +774,8 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
             "pitch": pitch,
             "pitch_rate": pitch_rate,
             "roll": roll,
+            "position_x": float(self.data.qpos[self._base_qpos]),
+            "position_y": float(self.data.qpos[self._base_qpos + 1]),
             "forward_velocity": forward_velocity,
             "yaw_rate": yaw_rate,
             "v_cmd": float(self._command[0]),

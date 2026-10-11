@@ -124,6 +124,8 @@ class RandomizationConfig:
 class EnvironmentConfig:
     model_file: str = "XML-test.xml"
     frame_skip: int = 2
+    imu_update_interval_steps: int = 1
+    encoder_update_interval_steps: int = 1
     max_episode_steps: int = 1_000
     history_length: int = 8
     initial_state_noise: float = 0.02

@@ -179,9 +179,14 @@ def evaluate_robustness(
     seed: int,
     max_steps: int,
     sensor_rates_hz: list[float],
+    domain_randomization: str = "full",
     base_environment_config: EnvironmentConfig = DEFAULT_ENVIRONMENT_CONFIG,
 ) -> dict:
     """Compare full-rate sensors with slower IMU, encoder, and combined sensor updates."""
+    if domain_randomization not in ("none", "full"):
+        raise ValueError("domain_randomization must be 'none' or 'full'")
+    domain_randomization_enabled = domain_randomization == "full"
+    stage = 3
     probe = SelfBalancingRobotEnv(environment_config=base_environment_config)
     control_hz = 1.0 / probe.dt
     probe.close()
@@ -194,11 +199,15 @@ def evaluate_robustness(
             encoder_update_interval_steps=scenario["encoder_interval"],
             max_episode_steps=max_steps,
         )
-        env = SelfBalancingRobotEnv(curriculum_stage=3, environment_config=env_config)
+        env = SelfBalancingRobotEnv(
+            curriculum_stage=stage,
+            environment_config=env_config,
+            domain_randomization=domain_randomization_enabled,
+        )
         env.set_difficulty_level(env.max_level)
         traces = []
         for episode in range(episodes):
-            env.set_curriculum_stage(3)
+            env.set_curriculum_stage(stage)
             env.set_difficulty_level(env.max_level)
             traces.append(
                 run_episode(
@@ -236,6 +245,8 @@ def evaluate_robustness(
         result["survival_rate_change_vs_baseline"] = result["survival_rate"] - baseline_survival
     return {
         "control_rate_hz": control_hz,
+        "domain_randomization": domain_randomization,
+        "curriculum_stage": stage,
         "episodes_per_scenario": episodes,
         "max_steps": max_steps,
         "scenarios": results,
@@ -250,10 +261,12 @@ def run_quantitative_suite(
     max_steps: int,
     settle_seconds: float,
     sensor_rates_hz: list[float],
+    domain_randomization: str = "full",
 ) -> dict:
     results = {
         "seed": seed,
         "suite": suite,
+        "domain_randomization": domain_randomization,
     }
     if suite in ("balance", "all"):
         env = SelfBalancingRobotEnv(
@@ -281,6 +294,6 @@ def run_quantitative_suite(
             env.close()
     if suite in ("robustness", "all"):
         results["robustness"] = evaluate_robustness(
-            model, episodes, seed, max_steps, sensor_rates_hz
+            model, episodes, seed, max_steps, sensor_rates_hz, domain_randomization
         )
     return results

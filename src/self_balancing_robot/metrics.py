@@ -13,7 +13,15 @@ import numpy as np
 
 from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
 
-TRACE_KEYS = ("v_cmd", "forward_velocity", "omega_cmd", "yaw_rate", "pitch")
+TRACE_KEYS = (
+    "v_cmd",
+    "forward_velocity",
+    "omega_cmd",
+    "yaw_rate",
+    "pitch",
+    "position_x",
+    "position_y",
+)
 METRIC_KEYS = ("reward", "survival", "linear_error", "angular_error", "abs_pitch_deg")
 
 
@@ -23,6 +31,7 @@ def run_episode(
     """Run one deterministic episode and return its time series."""
     observation, _ = env.reset(seed=seed)
     trace: dict[str, list] = {key: [] for key in (*TRACE_KEYS, "action", "reward")}
+    initial_position = env.data.qpos[env._base_qpos : env._base_qpos + 2].copy()
     info: dict = {}
     for _ in range(max_steps or env.max_episode_steps):
         action, _ = model.predict(observation, deterministic=True)
@@ -41,6 +50,7 @@ def run_episode(
     result["end"] = info.get("terminated_reason") or "max_steps"
     result["survived"] = result["end"] in ("timeout", "max_steps")
     result["upright_limit"] = env.environment_config.upright_limit_radians
+    result["initial_position"] = initial_position
     return result
 
 

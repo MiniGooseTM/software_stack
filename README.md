@@ -43,6 +43,22 @@ saves the per-episode plot for every evaluated episode. Evaluation frequency and
 changed with `--eval-freq` and `--eval-episodes`. `make evaluate EVALUATE_ARGS="--stage 3"` evaluates a
 policy at the last level of a curriculum stage.
 
+The same `make evaluate` command also runs quantitative suites:
+`make evaluate EVALUATE_ARGS="--model models/ppo_balance.zip --suite all --episodes 5 --output results/evaluation.json"`.
+The `balance` suite reports planar position drift and mean absolute pitch error at zero command;
+`tracking` reports steady-state linear and angular velocity MAE over signed command setpoints,
+excluding the first second by default. `robustness` compares the full-rate policy against IMU-only,
+encoder-only, and combined sensor-rate reductions (50, 25 and 10 Hz by default), reporting survival,
+survival time, pitch error and velocity MAE. Sensor rates must divide the simulation control rate;
+use `--sensor-rates-hz` to choose rates or `--suite` to run one suite. The robustness suite always
+uses stage 3 commands; `--domain-randomization none` disables randomized physics, sensor noise,
+pushes, and latency while preserving stage 3, and `--domain-randomization full` enables them (the
+quantitative default). Run either choice with `--suite all` to compare balance, tracking, and
+robustness for that setting. The option also toggles randomization independently of `--stage` in the
+standard evaluator. Results are printed as JSON and
+optionally written to `--output`. The default `--suite standard` keeps the original per-episode
+summary, plotting, and rendering behavior.
+
 To drive a trained policy yourself, run `make teleop` (or `make teleop TELEOP_ARGS="--stage 3"` to add
 noise, slopes and random pushes). A window opens with a camera behind and above the robot: hold the
 arrow keys to drive and turn, `+`/`-` change the speed limit (starts at 100% = 0.3 m/s and 1.5 rad/s, the
@@ -80,7 +96,8 @@ On an Ubuntu host with an NVIDIA runtime, use `Dockerfile.gpu` and add `--gpus a
 - `src/self_balancing_robot/envs/balance_env.py`: Gymnasium environment, actor/privileged observations, unified reward, command curriculum, and stage-four randomization.
 - `src/self_balancing_robot/policy.py`: asymmetric actor-critic policy (ESP32 actor, privileged critic).
 - `src/self_balancing_robot/train.py`: vectorized PPO training entry point.
-- `src/self_balancing_robot/evaluate.py`: visual evaluation entry point.
+- `src/self_balancing_robot/evaluate.py`: standard and quantitative evaluation entry point.
+- `src/self_balancing_robot/evaluate_suite.py`: reusable quantitative balance, tracking, and sensor-rate metrics.
 - `src/self_balancing_robot/teleop.py`: keyboard driving of a trained policy in a live window.
 - `src/self_balancing_robot/export.py`: actor weights to a C header and a policy file for the ESP32.
 - `tests/`: environment smoke tests.
