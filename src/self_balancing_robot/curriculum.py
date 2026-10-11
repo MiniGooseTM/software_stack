@@ -125,7 +125,10 @@ COMMANDS_3 = replace(COMMANDS_2, name="commands 0.3 m/s", command_max=(0.3, 1.87
 COMMANDS_4 = replace(COMMANDS_3, name="commands 0.4 m/s", command_max=FULL_COMMAND)
 
 # Full commands on an imperfect world. Mass, friction, latency and noise are on from the first
-# step; slope, pushes and the CoM shift grow in six equal steps up to 0.3 rad, 1 N and 8 mm.
+# step; slope, pushes and the CoM shift grow in six equal steps up to 0.3 rad, 0.7 N and 8 mm.
+# - Pushes: PUSH_MAX for 0.1 s. 1 N kicked the 0.27 kg goose robot by 0.37 m/s (0.19 m/s on
+#   the 0.52 kg robot it was tuned on), and the 0.4 m/s run stalled at randomization 4/6
+#   (0.67 N) for 300M steps at 75-88% survival; 0.7 N gives 0.26 m/s.
 # - Slopes: the base hits the ground at 0.5 rad of tilt relative to the surface, so above
 #   ~0.3 rad slopes cannot be driven straight up or down (v2: 0% survival above 0.3 rad).
 # - CoM: the nominal CoM is 4.9 cm above the axle. Up to v7 the shift was 4.9 mm from the
@@ -134,11 +137,12 @@ COMMANDS_4 = replace(COMMANDS_3, name="commands 0.4 m/s", command_max=FULL_COMMA
 # - Test: slopes cost speed uphill (at 0.3 rad, 0.4 m/s took almost full duty), so the speed
 #   ratio is a bit lower; v6 (85% survival, no speed check) drifted back to ~70% of the
 #   command. Standing still on slopes: v4 and v6 drifted at 0.07-0.10 m/s.
+PUSH_MAX = 0.7
 RANDOMIZATION_1 = replace(
     COMMANDS_4,
     name="randomization 1/6",
     slope_max=0.05,
-    push_max=1.0 / 6,
+    push_max=PUSH_MAX / 6,
     com_offset_max=0.008 / 6,
     mass_fraction=0.10,
     friction_fraction=0.40,
@@ -155,35 +159,35 @@ RANDOMIZATION_2 = replace(
     RANDOMIZATION_1,
     name="randomization 2/6",
     slope_max=0.10,
-    push_max=2.0 / 6,
+    push_max=PUSH_MAX * 2 / 6,
     com_offset_max=0.008 * 2 / 6,
 )
 RANDOMIZATION_3 = replace(
     RANDOMIZATION_2,
     name="randomization 3/6",
     slope_max=0.15,
-    push_max=3.0 / 6,
+    push_max=PUSH_MAX * 3 / 6,
     com_offset_max=0.008 * 3 / 6,
 )
 RANDOMIZATION_4 = replace(
     RANDOMIZATION_3,
     name="randomization 4/6",
     slope_max=0.20,
-    push_max=4.0 / 6,
+    push_max=PUSH_MAX * 4 / 6,
     com_offset_max=0.008 * 4 / 6,
 )
 RANDOMIZATION_5 = replace(
     RANDOMIZATION_4,
     name="randomization 5/6",
     slope_max=0.25,
-    push_max=5.0 / 6,
+    push_max=PUSH_MAX * 5 / 6,
     com_offset_max=0.008 * 5 / 6,
 )
 RANDOMIZATION_6 = replace(
     RANDOMIZATION_5,
     name="randomization 6/6",
     slope_max=0.30,
-    push_max=1.0,
+    push_max=PUSH_MAX,
     com_offset_max=0.008,
 )
 

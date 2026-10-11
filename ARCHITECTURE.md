@@ -188,7 +188,7 @@ The same export also writes the **policy file** `models/policy.bin` (format in t
 *   A CRC-32 of the whole file, which also identifies the policy in the firmware log.
 
 ### 4.8 What the Policy Was Trained to Handle
-*   Mass +-10%, CoM shift up to 8 mm per axis, floor friction +-40%, slopes up to 0.3 rad, pushes up to 1 N for 0.1 s, sensor noise and 0-2 steps of latency (the last stage of `CURRICULUM` in `curriculum.py`).
+*   Mass +-10%, CoM shift up to 8 mm per axis, floor friction +-40%, slopes up to 0.3 rad, pushes up to 0.7 N for 0.1 s, sensor noise and 0-2 steps of latency (the last stage of `CURRICULUM` in `curriculum.py`).
 *   Known weaknesses (`models/archive/v10_reversals_30M/README.md`): forward speed undershoots by ~20%, a forward CoM shift turns into a speed offset (no integral term), and survival on slopes above 0.2 rad is low.
 *   Training ends an episode when roll or pitch passes 0.6 rad, the robot spins faster than 3 rad/s, or the chassis touches the ground: past that the policy has never been trained, so cut the motors there.
 

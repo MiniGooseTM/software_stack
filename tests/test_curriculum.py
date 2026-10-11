@@ -27,7 +27,7 @@ def test_default_curriculum_keeps_the_tuned_progression():
     randomized = CURRICULUM[5:]
     for k, stage in enumerate(randomized, start=1):
         assert np.isclose(stage.slope_max, k / 6 * 0.3)
-        assert np.isclose(stage.push_max, k / 6 * 1.0)
+        assert np.isclose(stage.push_max, k / 6 * 0.7)
         assert np.isclose(stage.com_offset_max, k / 6 * 0.008)
         assert (stage.mass_fraction, stage.friction_fraction) == (0.10, 0.40)
         assert stage.max_latency_steps == 2 and stage.imu_angle_noise > 0
@@ -49,7 +49,7 @@ def test_band_floors_come_from_the_previous_stage():
     )
     assert np.all(table["command_floor"][5:] == 0)
     np.testing.assert_allclose(table["slope_floor"][5:], np.arange(6) / 6 * 0.3, atol=1e-6)
-    np.testing.assert_allclose(table["push_floor"][5:], np.arange(6) / 6, atol=1e-6)
+    np.testing.assert_allclose(table["push_floor"][5:], np.arange(6) / 6 * 0.7, atol=1e-6)
 
 
 def test_unchecked_criteria_always_pass_in_the_table():
