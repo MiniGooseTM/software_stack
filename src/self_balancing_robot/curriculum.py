@@ -1,7 +1,8 @@
 """The training curriculum: an ordered list of stages, each with everything that defines it.
 
 A `Stage` says what the environment samples (command range, slopes, pushes, randomized
-physics, sensor latency and noise) and the test to leave it. Training starts at the first
+physics, sensor latency and noise), the reward weights (`RewardConfig`, from `config.py`
+unless the stage changes them) and the test to leave it. Training starts at the first
 stage of `CURRICULUM` and moves to the next one once a window of `EVALUATION_WINDOW`
 episodes, pooled over all parallel environments, passes the stage's test (see
 `envs/wrappers.py`). The last stage is never left.
@@ -19,9 +20,11 @@ quantity, it is drawn as 0 or uniform up to its maximum. Signs and directions ar
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 
 import numpy as np
+
+from self_balancing_robot.config import DEFAULT_REWARD_CONFIG, RewardConfig
 
 # Full command range (v m/s, omega rad/s): observations are scaled by it, and every command
 # is scaled down so the outer wheel never needs more than the full speed (see
@@ -46,6 +49,9 @@ EVALUATION_WINDOW = 1_000
 SPEED_RATIO_MIN_FRACTION = 1.0 / 3.0
 SPEED_RATIO_MIN_COMMAND = 0.05
 SPEED_RATIO_SETTLE_S = 1.0
+# Battery voltage (V) the motor model in `assets/goose.xml` is written for (3S LiPo nominal):
+# its no-load speed (ctrlrange) and stall torque (forcerange) scale with the voltage.
+NOMINAL_VOLTAGE = 11.1
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,9 @@ class Stage:
     # Base mass and floor friction: uniform within +- this fraction of nominal.
     mass_fraction: float = 0.0
     friction_fraction: float = 0.0
+    # Battery voltage (V), uniform in (min, max): the motors' no-load speed and stall torque
+    # for a given PWM duty scale with it.
+    battery_voltage: tuple[float, float] = (NOMINAL_VOLTAGE, NOMINAL_VOLTAGE)
     # Motor, IMU and encoder delays: each 0 to this many control steps (10 ms).
     max_latency_steps: int = 0
     # Gaussian sensor noise (std) on IMU angles (rad), IMU rates (rad/s), wheel speeds (rad/s).
@@ -90,6 +99,9 @@ class Stage:
     # How magnitudes are drawn (see the module docstring).
     zero_probability: float = 0.1
     frontier_probability: float = 0.4
+
+    # --- The reward (weights and kernel widths) ---
+    rewards: RewardConfig = DEFAULT_REWARD_CONFIG
 
     # --- The test to leave the stage, on a window of finished episodes (None = not checked) ---
     # Episodes played at the stage before any window can pass.
@@ -159,14 +171,17 @@ COMMANDS_3 = replace(
     encoder_noise=ENCODER_NOISE,
 )
 
-# Full commands on an imperfect world. Mass and friction are on from the first step (noise
-# and latency already are); slope, pushes, the CoM shift and the wheel torques grow in six
-# equal steps up to 0.3 rad, 0.5 N, 8 mm, 0.01 N m offset and 0.02 N m kicks.
+# Full commands on an imperfect world. Mass, friction and battery voltage are on from the
+# first step (noise and latency already are); slope, pushes, the CoM shift and the wheel
+# torques grow in six equal steps up to 0.3 rad, 0.5 N, 8 mm, 0.01 N m offset and 0.02 N m
+# kicks.
 # - Pushes: the robot weighs 0.27 kg, so a 0.1 s push of 1 N (the maximum up to v9) gave it
 #   ~0.37 m/s, more than the full command and ~70% of the wheel no-load speed (~0.53 m/s);
 #   0.5 N gives ~0.19 m/s.
 # - Wheel torques, against the 0.109 N m stall torque per motor: the offset is ~9% (as much
 #   as the modelled gearbox friction), the kicks ~18%.
+# - Battery: a 3S LiPo goes from ~12.5 V charged down to ~10.5 V before cutoff, so the same
+#   PWM duty gives -5% to +13% of the nominal (11.1 V) motor speed and torque.
 # - Slopes: the base hits the ground at 0.5 rad of tilt relative to the surface, so above
 #   ~0.3 rad slopes cannot be driven straight up or down (v2: 0% survival above 0.3 rad).
 # - CoM: the nominal CoM is 4.9 cm above the axle. Up to v7 the shift was 4.9 mm from the
@@ -189,6 +204,7 @@ RANDOMIZATION_1 = replace(
     wheel_kick_max=WHEEL_KICK_MAX / 6,
     mass_fraction=0.10,
     friction_fraction=0.40,
+    battery_voltage=(10.5, 12.5),
     min_episodes=5_000,
     success_rate=0.90,
     speed_ratio=0.85,
@@ -221,6 +237,11 @@ RANDOMIZATION_4 = replace(
     wheel_torque_max=WHEEL_TORQUE_MAX * 4 / 6,
     wheel_kick_max=WHEEL_KICK_MAX * 4 / 6,
 )
+# The last two stages ask for smoother actions. Up to here the smoothness term cost < 1% of
+# the reward (run 20261011-120218: (a_t - a_t-1)^2 ~0.008 per step against ~5 from staying up
+# and tracking), so it hardly shaped the policy. It is not raised from the start: it also
+# charges the exploration noise, ~1.4 per step at the initial std of 0.6 (14 at a weight of
+# 10, far above the alive reward), while by these stages the std is ~0.06.
 RANDOMIZATION_5 = replace(
     RANDOMIZATION_4,
     name="randomization 5/6",
@@ -229,6 +250,7 @@ RANDOMIZATION_5 = replace(
     com_offset_max=COM_OFFSET_MAX * 5 / 6,
     wheel_torque_max=WHEEL_TORQUE_MAX * 5 / 6,
     wheel_kick_max=WHEEL_KICK_MAX * 5 / 6,
+    rewards=replace(DEFAULT_REWARD_CONFIG, smoothness_weight=5.0),
 )
 RANDOMIZATION_6 = replace(
     RANDOMIZATION_5,
@@ -238,6 +260,7 @@ RANDOMIZATION_6 = replace(
     com_offset_max=COM_OFFSET_MAX,
     wheel_torque_max=WHEEL_TORQUE_MAX,
     wheel_kick_max=WHEEL_KICK_MAX,
+    rewards=replace(DEFAULT_REWARD_CONFIG, smoothness_weight=10.0),
 )
 
 CURRICULUM: tuple[Stage, ...] = (
@@ -275,12 +298,11 @@ def validate(curriculum: tuple[Stage, ...]) -> None:
     if len(set(names)) != len(names):
         raise ValueError(f"stage names must be unique: {names}")
     for stage in curriculum:
-        for field in fields(stage):
-            value = getattr(stage, field.name)
+        for name, value in _settings(stage):
             if isinstance(value, (int, float)) and value < 0:
-                raise ValueError(f"{stage.name}: {field.name} is negative")
+                raise ValueError(f"{stage.name}: {name} is negative")
             if isinstance(value, tuple) and min(value) < 0:
-                raise ValueError(f"{stage.name}: {field.name} is negative")
+                raise ValueError(f"{stage.name}: {name} is negative")
         if stage.zero_probability + stage.frontier_probability > 1:
             raise ValueError(f"{stage.name}: zero + frontier probability is above 1")
         probabilities = (stage.reversal_probability, stage.stop_probability, stage.success_rate)
@@ -288,7 +310,7 @@ def validate(curriculum: tuple[Stage, ...]) -> None:
             raise ValueError(f"{stage.name}: a probability or rate is above 1")
         if any(c > full for c, full in zip(stage.command_max, FULL_COMMAND)):
             raise ValueError(f"{stage.name}: command_max is above FULL_COMMAND {FULL_COMMAND}")
-        for field in ("push_interval_s", "wheel_kick_interval_s"):
+        for field in ("push_interval_s", "wheel_kick_interval_s", "battery_voltage"):
             low, high = getattr(stage, field)
             if low > high:
                 raise ValueError(f"{stage.name}: {field} must be (min, max)")
@@ -309,23 +331,32 @@ def stage_index(curriculum: tuple[Stage, ...], stage: str | int) -> int:
     return stage % len(curriculum)
 
 
+def _settings(stage: Stage) -> list[tuple[str, object]]:
+    """(name, value) of every setting of a stage, the reward's fields under their own names."""
+    settings = []
+    for field in fields(Stage):
+        value = getattr(stage, field.name)
+        if is_dataclass(value):
+            settings += [(f.name, getattr(value, f.name)) for f in fields(value)]
+        elif field.name != "name":
+            settings.append((field.name, value))
+    return settings
+
+
 def stage_table(curriculum: tuple[Stage, ...]) -> dict[str, np.ndarray]:
     """The curriculum as arrays with one row per stage, for lookups inside JAX code.
 
-    Adds the band floors of the banded quantities (`<quantity>_floor`: the previous stage's
-    maximum if this stage raised it, else 0) and turns unchecked criteria (None) into
-    values that always pass.
+    The reward's fields get a column each (`smoothness_weight`, ...). Adds the band floors
+    of the banded quantities (`<quantity>_floor`: the previous stage's maximum if this stage
+    raised it, else 0) and turns unchecked criteria (None) into values that always pass.
     """
     validate(curriculum)
     table: dict[str, list] = {}
     for stage in curriculum:
-        for field in fields(Stage):
-            if field.name == "name":
-                continue
-            value = getattr(stage, field.name)
+        for name, value in _settings(stage):
             if value is None:
-                value = {"still_speed_limit": np.inf}.get(field.name, 0.0)
-            table.setdefault(field.name, []).append(value)
+                value = {"still_speed_limit": np.inf}.get(name, 0.0)
+            table.setdefault(name, []).append(value)
     arrays = {
         name: np.asarray(
             values, dtype=np.int32 if name in ("max_latency_steps", "min_episodes") else np.float32

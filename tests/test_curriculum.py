@@ -3,6 +3,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from self_balancing_robot.config import RewardConfig
 from self_balancing_robot.curriculum import (
     BALANCE,
     CURRICULUM,
@@ -30,6 +31,7 @@ def test_default_curriculum_keeps_the_tuned_progression():
         assert np.isclose(stage.wheel_torque_max, k / 6 * 0.01)
         assert np.isclose(stage.wheel_kick_max, k / 6 * 0.02)
         assert (stage.mass_fraction, stage.friction_fraction) == (0.10, 0.40)
+        assert stage.battery_voltage == (10.5, 12.5)
         assert stage.max_latency_steps == 2 and stage.imu_angle_noise > 0
         assert (stage.min_episodes, stage.success_rate, stage.speed_ratio) == (5_000, 0.90, 0.85)
         assert stage.still_speed_limit == 0.05 and stage.reversal_success_rate == 0.85
@@ -55,6 +57,13 @@ def test_band_floors_come_from_the_previous_stage():
     np.testing.assert_allclose(table["slope_floor"][4:], np.arange(6) / 6 * 0.3, atol=1e-6)
     np.testing.assert_allclose(table["push_floor"][4:], np.arange(6) / 6 * 0.5, atol=1e-6)
     np.testing.assert_allclose(table["wheel_torque_floor"][4:], np.arange(6) / 6 * 0.01, atol=1e-6)
+
+
+def test_reward_settings_get_a_column_per_stage():
+    table = stage_table(CURRICULUM)
+    weights = [stage.rewards.smoothness_weight for stage in CURRICULUM]
+    np.testing.assert_allclose(table["smoothness_weight"], weights)
+    assert "rewards" not in table and table["alive_weight"].shape == (len(CURRICULUM),)
 
 
 def test_unchecked_criteria_always_pass_in_the_table():
@@ -86,6 +95,8 @@ def test_stages_are_found_by_name_or_index():
         ((replace(BALANCE, command_max=(0.5, 1.0)),), "FULL_COMMAND"),
         ((replace(BALANCE, push_interval_s=(4.0, 2.0)),), "push_interval_s"),
         ((replace(BALANCE, wheel_kick_interval_s=(3.0, 1.0)),), "wheel_kick_interval_s"),
+        ((replace(BALANCE, battery_voltage=(12.5, 10.5)),), "battery_voltage"),
+        ((replace(BALANCE, rewards=RewardConfig(smoothness_weight=-1.0)),), "smoothness"),
     ],
 )
 def test_invalid_curricula_are_rejected(curriculum, message):

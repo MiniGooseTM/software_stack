@@ -7,14 +7,16 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class RewardConfig:
+    """The reward of every curriculum stage, unless a stage sets its own (`Stage.rewards`)."""
+
     alive_weight: float = 2.0
     pitch_rate_weight: float = 0.1
     # Above the yaw weight so speed tracking still pays on slopes (v5 at 1.5 drove at ~60%
     # of the commanded speed).
     linear_velocity_weight: float = 2.0
     angular_velocity_weight: float = 1.0
-    action_weight: float = 0.01
-    smoothness_weight: float = 0.5
+    action_weight: float = 0.05
+    smoothness_weight: float = 1.0
     # Speed tracking blends a narrow kernel (precision near the command) with a wide one
     # (a gradient even far from it). With only the narrow kernel, v2 learned to crawl at
     # 0.05 m/s for 0.5 m/s commands because speeding up earned no reward until close.
@@ -69,7 +71,7 @@ class PolicyConfig:
 class TrainingConfig:
     # Brax PPO on GPU. One PPO iteration collects num_envs * unroll_length steps and splits
     # them into num_minibatches minibatches (num_envs must be a multiple of num_minibatches).
-    total_timesteps: int = 200_000_000
+    total_timesteps: int = 250_000_000
     num_envs: int = 4096
     unroll_length: int = 32
     num_minibatches: int = 16

@@ -12,6 +12,7 @@ from self_balancing_robot.curriculum import (
     BALANCE,
     CURRICULUM,
     FULL_COMMAND,
+    NOMINAL_VOLTAGE,
     RANDOMIZATION_1,
     REVERSAL_MIN_FRACTION,
     SPEED_RATIO_SETTLE_S,
@@ -98,13 +99,20 @@ def test_positive_action_drives_forward_and_differential_action_turns(env):
     assert state.info["yaw_rate"] > 0.0
 
 
-def test_reward_components_follow_configured_weights(env):
-    state = step(env, reset(env, seed=1))
+@pytest.mark.parametrize("stage", [0, LAST])
+def test_reward_components_follow_the_stages_weights(env, stage):
+    state = step(env, reset(env, seed=1, stage=stage), (0.2, -0.1))
     assert not state.info["terminated"]
-    cfg, terms = env.reward_config, state.info["reward_terms"]
+    cfg, terms = CURRICULUM[stage].rewards, state.info["reward_terms"]
     assert terms["alive"] == 1.0
     expected = sum(getattr(cfg, f"{name}_weight") * terms[name] for name in REWARD_TERMS)
     assert np.isclose(state.reward, expected, rtol=1e-5)
+
+
+def test_last_stages_weigh_smoothness_more():
+    weights = [stage.rewards.smoothness_weight for stage in CURRICULUM]
+    assert weights[-2:] == [5.0, 10.0]
+    assert all(w == RewardConfig().smoothness_weight for w in weights[:-2])
 
 
 def test_action_penalties_use_policy_action_not_delayed_action(env):
@@ -178,6 +186,7 @@ def test_physics_is_randomized_only_where_the_stage_says_so(env):
         assert info["mass_scale"] == 1.0 and info["friction_scale"] == 1.0
         assert np.all(info["com_offset"] == 0.0) and info["ground_normal"][2] == 1.0
         assert np.all(info["wheel_torque"] == 0.0)
+        assert np.isclose(info["battery_voltage"], NOMINAL_VOLTAGE)
     assert reset(env, seed=8, stage="balance").info["motor_latency"] == 0
     info = reset(env, seed=8, stage=LAST).info
     assert info["mass_scale"] != 1.0 and info["friction_scale"] != 1.0
@@ -213,6 +222,9 @@ def test_samples_stay_within_each_stages_maxima(env):
         assert info["wheel_torque"].shape == (50, 2), stage.name
         assert np.all(np.abs(info["wheel_torque"]) <= stage.wheel_torque_max + 1e-6), stage.name
         assert np.all(np.abs(info["mass_scale"] - 1) <= stage.mass_fraction + 1e-6), stage.name
+        low, high = stage.battery_voltage
+        voltage = info["battery_voltage"]
+        assert np.all((voltage >= low - 1e-5) & (voltage <= high + 1e-5)), stage.name
         assert np.all(info["motor_latency"] <= stage.max_latency_steps), stage.name
         if stage.command_max[0] > 0:  # the new band is actually reached
             assert np.abs(info["command"][:, 0]).max() > 0.5 * stage.command_max[0], stage.name
@@ -286,6 +298,25 @@ def test_held_command_is_not_resampled(env):
 
     _, commands = jax.jit(lambda s: jax.lax.scan(body, s, None, int(6.0 / env.dt)))(state)
     np.testing.assert_allclose(commands, np.tile([0.2, -0.5], (len(commands), 1)), rtol=1e-6)
+
+
+def test_battery_voltage_scales_motor_speed_and_torque(env):
+    nominal = env.mj_model
+    wheel_speeds = []
+    for voltage in (10.5, 12.5):
+        state = set_info(reset(env, seed=6, stage=LAST), battery_voltage=voltage, motor_latency=0)
+        model = env._episode_model(state.info)
+        scale = voltage / NOMINAL_VOLTAGE
+        np.testing.assert_allclose(
+            model.actuator_ctrlrange, nominal.actuator_ctrlrange * scale, rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            model.actuator_forcerange, nominal.actuator_forcerange * scale, rtol=1e-6
+        )
+        state = _run(env, state, (1.0, 1.0), 5)
+        wheel_speeds.append(float(state.data.qvel[env._wheel_qvel].mean()))
+    # Full duty spins the wheels up faster on a charged battery.
+    assert wheel_speeds[1] > wheel_speeds[0] > 0.0
 
 
 def test_wheel_torques_act_on_the_wheel_joints(env):
@@ -397,7 +428,8 @@ def test_magnitude_sampling_favours_the_new_band_but_keeps_easier_values(env, fl
 def test_yaw_rate_reward_uses_the_narrow_kernel_only(env):
     state = step(env, reset(env, seed=17, stage=COMMANDS_LOW, command_held=True, command=[0.0, 1.0]))
     error = state.info["yaw_rate"] - 1.0
-    expected = np.exp(-(error**2) / env.reward_config.angular_velocity_variance)
+    variance = CURRICULUM[env.stage_index(COMMANDS_LOW)].rewards.angular_velocity_variance
+    expected = np.exp(-(error**2) / variance)
     assert np.isclose(state.info["reward_terms"]["angular_velocity"], expected, rtol=1e-5)
 
 

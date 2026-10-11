@@ -21,15 +21,14 @@ from mujoco_playground._src import mjx_env
 
 from self_balancing_robot.config import (
     DEFAULT_ENVIRONMENT_CONFIG,
-    DEFAULT_REWARD_CONFIG,
     EnvironmentConfig,
-    RewardConfig,
 )
 from self_balancing_robot.curriculum import (
     BANDED,
     COMMAND_RESAMPLE_S,
     CURRICULUM,
     FULL_COMMAND,
+    NOMINAL_VOLTAGE,
     REVERSAL_MIN_FRACTION,
     SPEED_RATIO_MIN_COMMAND,
     SPEED_RATIO_MIN_FRACTION,
@@ -74,6 +73,7 @@ PRIVILEGED_FIELDS = (
     "com_offset_z",
     "mass_deviation",
     "friction_deviation",
+    "battery_voltage_deviation",
     "push_force_forward",
     "push_force_lateral",
     "wheel_torque_left",
@@ -194,7 +194,6 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
 
     def __init__(
         self,
-        reward_config: RewardConfig | None = None,
         environment_config: EnvironmentConfig | None = None,
         max_episode_steps: int | None = None,
         curriculum: tuple[Stage, ...] = CURRICULUM,
@@ -203,7 +202,6 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         impl: str = "jax",
     ):
         self.environment_config = environment_config or DEFAULT_ENVIRONMENT_CONFIG
-        self.reward_config = reward_config or DEFAULT_REWARD_CONFIG
         self.curriculum = tuple(curriculum)
         # One row per stage; `stage_params` picks the current stage's row inside JAX code.
         self._table = stage_table(self.curriculum)
@@ -215,6 +213,7 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             "com_offset": float(table["com_offset_max"].max()),
             "mass": float(table["mass_fraction"].max()),
             "friction": float(table["friction_fraction"].max()),
+            "voltage": float(np.abs(table["battery_voltage"] - NOMINAL_VOLTAGE).max()),
             "push": float(table["push_max"].max()),
             "wheel_torque": float(table["wheel_torque_max"].max()),
             "wheel_kick": float(table["wheel_kick_max"].max()),
@@ -255,6 +254,8 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         # Normalized action a in [-1, 1] is the PWM duty; the velocity actuator turns
         # duty * no-load speed into DC-motor torque.
         self._max_wheel_speed = float(model.actuator_ctrlrange[:, 1].min())
+        self._nominal_ctrlrange = model.actuator_ctrlrange.copy()
+        self._nominal_forcerange = model.actuator_forcerange.copy()
         self._wheel_radius = float(model.geom("left_wheel_collision").size[0])
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
@@ -413,10 +414,14 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
     # ------------------------------------------------------------------ physics
 
     def _episode_model(self, info: dict) -> mjx.Model:
-        """MJX model with this episode's mass, CoM and friction."""
+        """MJX model with this episode's mass, CoM, friction and motor voltage."""
         model = self._mjx_model
         base = self._base_body_id
+        voltage_scale = info["battery_voltage"] / NOMINAL_VOLTAGE
         return model.replace(
+            # The motors' no-load speed and stall torque are proportional to the voltage.
+            actuator_ctrlrange=self._nominal_ctrlrange * voltage_scale,
+            actuator_forcerange=self._nominal_forcerange * voltage_scale,
             body_mass=model.body_mass.at[base].set(self._nominal_mass * info["mass_scale"]),
             body_inertia=model.body_inertia.at[base].set(
                 self._nominal_inertia * info["mass_scale"]
@@ -516,6 +521,7 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
                     [
                         _normalized(info["mass_scale"] - 1.0, scale["mass"]),
                         _normalized(info["friction_scale"] - 1.0, scale["friction"]),
+                        _normalized(info["battery_voltage"] - NOMINAL_VOLTAGE, scale["voltage"]),
                         _normalized(info["push_force"] @ forward, scale["push"]),
                         _normalized(info["push_force"] @ lateral, scale["push"]),
                     ]
@@ -566,6 +572,9 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         com_offset = self._sample_banded(keys[1], params, "com_offset")
         friction_scale = jax.random.uniform(
             keys[2], minval=1 - params["friction_fraction"], maxval=1 + params["friction_fraction"]
+        )
+        battery_voltage = jax.random.uniform(
+            keys[17], minval=params["battery_voltage"][0], maxval=params["battery_voltage"][1]
         )
         latency = [
             jax.random.randint(key, (), 0, params["max_latency_steps"] + 1) for key in keys[3:6]
@@ -637,6 +646,7 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             "encoder_latency": latency[2],
             "mass_scale": mass_scale,
             "friction_scale": friction_scale,
+            "battery_voltage": battery_voltage,
             "com_offset": com_offset,
             "slope": slope,
             "ground_normal": ground_normal,
@@ -766,9 +776,9 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             info["wheel_torque"] + info["wheel_kick"]
         )
         data = state.data.replace(xfrc_applied=xfrc, qfrc_applied=qfrc)
-        data = mjx_env.step(
-            self._episode_model(info), data, applied_action * self._max_wheel_speed, self.n_substeps
-        )
+        # The PWM duty sets the motor voltage: duty * no-load speed at this episode's battery.
+        speed = applied_action * self._max_wheel_speed * info["battery_voltage"] / NOMINAL_VOLTAGE
+        data = mjx_env.step(self._episode_model(info), data, speed, self.n_substeps)
         info["episode_step"] = info["episode_step"] + 1
 
         rotation = self._rotation(data.qpos)
@@ -781,7 +791,8 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
 
         # Rewards use the command the policy was conditioned on and its own action
         # (a_t, a_{t-1}), which is also what the ESP32 feeds back as the previous action.
-        cfg = self.reward_config
+        # This stage's weights and kernel widths (`Stage.rewards`).
+        cfg = self.stage_params(info["stage"])
         reward_terms = {
             "alive": 1.0,
             # Penalize pitch motion, not the lean itself: the balance angle depends on the
@@ -789,11 +800,11 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             "pitch_rate": -(pitch_rate**2),
             "linear_velocity": _tracking_kernel(
                 linear_error,
-                cfg.linear_velocity_variance,
-                cfg.linear_velocity_wide_variance,
-                cfg.linear_velocity_wide_fraction,
+                cfg["linear_velocity_variance"],
+                cfg["linear_velocity_wide_variance"],
+                cfg["linear_velocity_wide_fraction"],
             ),
-            "angular_velocity": jnp.exp(-(angular_error**2) / cfg.angular_velocity_variance),
+            "angular_velocity": jnp.exp(-(angular_error**2) / cfg["angular_velocity_variance"]),
             "action": -jnp.sum(jnp.square(action)),
             "smoothness": -jnp.sum(jnp.square(action - info["previous_action"])),
         }
@@ -805,12 +816,12 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         terminated = pitch_failure | spinning | self._base_collision(data)
         truncated = info["episode_step"] >= self.max_episode_steps
         reward = (
-            cfg.alive_weight * reward_terms["alive"]
-            + cfg.pitch_rate_weight * reward_terms["pitch_rate"]
-            + cfg.linear_velocity_weight * reward_terms["linear_velocity"]
-            + cfg.angular_velocity_weight * reward_terms["angular_velocity"]
-            + cfg.action_weight * reward_terms["action"]
-            + cfg.smoothness_weight * reward_terms["smoothness"]
+            cfg["alive_weight"] * reward_terms["alive"]
+            + cfg["pitch_rate_weight"] * reward_terms["pitch_rate"]
+            + cfg["linear_velocity_weight"] * reward_terms["linear_velocity"]
+            + cfg["angular_velocity_weight"] * reward_terms["angular_velocity"]
+            + cfg["action_weight"] * reward_terms["action"]
+            + cfg["smoothness_weight"] * reward_terms["smoothness"]
         )
         reward = jnp.where(terminated, 0.0, reward)
         done = terminated | truncated
