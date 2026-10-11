@@ -45,7 +45,7 @@ ASSETS = Path(__file__).parents[1] / "assets"
 
 # One proprioceptive frame O_t, as the ESP32 builds it. The actor sees the last
 # `history_length` frames, newest first. Commands are divided by the full command range
-# (v / 0.5 m/s, omega / 3.0 rad/s) and wheel velocities by the motor no-load speed;
+# (v / 0.4 m/s, omega / 2.5 rad/s) and wheel velocities by the motor no-load speed;
 # everything else is in SI units (rad, rad/s). With raw commands (|v| <= 0.1 at the first
 # command stage) the policy ignored them and stood still; scaled, it learned to follow them.
 ACTOR_FRAME_FIELDS = (
@@ -353,7 +353,7 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
 
         At 0.4 m/s and 1.5 rad/s the outer wheel would need ~0.5 m/s, more than the motors
         give while balancing: every v4 fall on flat ground came from such commands. The
-        limit is the full command speed (0.5 m/s). The ESP32 should limit joystick commands
+        limit is the full command speed (0.4 m/s). The ESP32 should limit joystick commands
         the same way.
         """
         full_speed = FULL_COMMAND[0]
