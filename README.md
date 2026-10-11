@@ -64,10 +64,10 @@ The script installs the environment on first use (with `uv` if available, which 
 
 ## Evaluation, driving and export
 
-`make evaluate` runs deterministic episodes of the newest run (or `--model <run dir or policy.bin>`) at the last curriculum stage (or `--stage <name or index>`, e.g. `EVALUATE_ARGS='--stage "commands 0.3 m/s"'`), in parallel, and prints per-episode metrics; `--plot-dir plots/eval` saves a plot of every episode and `--video eval.mp4` records the first one.
+`make evaluate` runs deterministic episodes of the newest run (or `--model <run dir or policy.bin>`) at the last curriculum stage (or `--stage <name or index>`, e.g. `EVALUATE_ARGS='--stage "commands 0.5 m/s"'`), in parallel, and prints per-episode metrics; `--plot-dir plots/eval` saves a plot of every episode and `--video eval.mp4` records the first one.
 
 To drive a trained policy yourself, run `make teleop`. It simulates the last curriculum stage (noise, latency,
-slopes and random pushes); `make teleop TELEOP_ARGS='--stage "commands 0.3 m/s"'` gives a clean simulation. A window opens with a camera behind and above the robot: hold the
+slopes and random pushes); `make teleop TELEOP_ARGS='--stage "commands 0.5 m/s"'` gives a clean simulation. A window opens with a camera behind and above the robot: hold the
 arrow keys to drive and turn, `+`/`-` change the speed limit (starts at 100% = 0.3 m/s and 1.5 rad/s, the
 training range; like in training, speed and turn rate are scaled down together when the outer wheel
 would need more than 0.3 m/s, so the ESP32 should limit joystick commands the same way), `V` cycles the camera (chase, top-down, side, free mouse view), Backspace

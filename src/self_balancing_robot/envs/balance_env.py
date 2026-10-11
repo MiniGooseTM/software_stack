@@ -76,8 +76,6 @@ PRIVILEGED_FIELDS = (
     "battery_voltage_deviation",
     "push_force_forward",
     "push_force_lateral",
-    "wheel_torque_left",
-    "wheel_torque_right",
     "wheel_kick_left",
     "wheel_kick_right",
     "motor_latency",
@@ -215,7 +213,6 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             "friction": float(table["friction_fraction"].max()),
             "voltage": float(np.abs(table["battery_voltage"] - NOMINAL_VOLTAGE).max()),
             "push": float(table["push_max"].max()),
-            "wheel_torque": float(table["wheel_torque_max"].max()),
             "wheel_kick": float(table["wheel_kick_max"].max()),
             "slope": float(np.sin(table["slope_max"].max())),
             "latency": float(max(self._max_latency, 1)),
@@ -526,7 +523,6 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
                         _normalized(info["push_force"] @ lateral, scale["push"]),
                     ]
                 ),
-                _normalized(info["wheel_torque"], scale["wheel_torque"]),
                 _normalized(info["wheel_kick"], scale["wheel_kick"]),
                 latencies / scale["latency"],
                 _normalized(
@@ -580,7 +576,6 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             jax.random.randint(key, (), 0, params["max_latency_steps"] + 1) for key in keys[3:6]
         ]
         slope = self._sample_banded(keys[6], params, "slope")
-        wheel_torque = self._sample_banded(keys[15], params, "wheel_torque", shape=(2,))
         slope_axis_angle = jax.random.uniform(keys[7], minval=-jnp.pi, maxval=jnp.pi)
 
         pinned_slope = ~jnp.isnan(persistent["override_slope"])
@@ -655,7 +650,6 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
             "next_impulse_time": jax.random.uniform(
                 keys[12], minval=params["push_interval_s"][0], maxval=params["push_interval_s"][1]
             ),
-            "wheel_torque": wheel_torque,
             "wheel_kick": jnp.zeros(2),
             "wheel_kick_end_time": jnp.float32(0.0),
             "next_wheel_kick_time": jax.random.uniform(
@@ -772,9 +766,7 @@ class SelfBalancingRobotEnv(mjx_env.MjxEnv):
         xfrc = jnp.zeros((self._mj_model.nbody, 6)).at[self._base_body_id, :2].set(info["push_force"])
         # A torque on a wheel joint acts on the wheel and, reversed, on the base, like the
         # motor: a motor or gearbox torque error.
-        qfrc = jnp.zeros(self._mj_model.nv).at[self._wheel_qvel].set(
-            info["wheel_torque"] + info["wheel_kick"]
-        )
+        qfrc = jnp.zeros(self._mj_model.nv).at[self._wheel_qvel].set(info["wheel_kick"])
         data = state.data.replace(xfrc_applied=xfrc, qfrc_applied=qfrc)
         # The PWM duty sets the motor voltage: duty * no-load speed at this episode's battery.
         speed = applied_action * self._max_wheel_speed * info["battery_voltage"] / NOMINAL_VOLTAGE

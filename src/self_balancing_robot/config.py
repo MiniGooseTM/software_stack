@@ -51,7 +51,7 @@ class EnvironmentConfig:
     # it, PPO on the GPU sometimes learned to balance while spinning in place at ~8 rad/s
     # (early on, spinning kept a barely trained robot up for longer), and the narrow yaw-rate
     # kernel gives no gradient back from that far away.
-    yaw_rate_limit_rad_s: float = 3.0
+    yaw_rate_limit_rad_s: float = 6.0
     camera_distance_m: float = 0.8
     camera_elevation_degrees: float = -20.0
     camera_azimuth_degrees: float = 45.0
@@ -62,7 +62,7 @@ class PolicyConfig:
     # v1-v7 used (64, 32): 7.8k weights. (128, 64, 32) has 21.8k (87 KB as float32, ~22k
     # multiply-adds per step), still far below the ESP32's flash and the 10 ms control step.
     actor_layers: tuple[int, ...] = (128, 64, 32)
-    critic_layers: tuple[int, ...] = (128, 64)
+    critic_layers: tuple[int, ...] = (128, 64, 32)
     # Initial action noise std (exp(-0.5), SB3's log_std_init of the earlier runs).
     init_noise_std: float = 0.6065
 

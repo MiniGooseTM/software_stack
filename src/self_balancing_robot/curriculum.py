@@ -10,12 +10,12 @@ episodes, pooled over all parallel environments, passes the stage's test (see
 To add or change a stage, edit `CURRICULUM` below; nothing else needs to change. Each stage is
 written as the previous one plus what changes (`replace(previous, ...)`).
 
-Magnitudes (command speed and yaw rate, slope, push, CoM shift, wheel torque offset and
-kicks) are drawn per stage as: 0 with
-`zero_probability` (stand still, flat ground, no push), in the band the stage added (from the
-previous stage's maximum up to this stage's) with `frontier_probability`, otherwise uniform
-below that band, so easier values keep being practised. If a stage does not raise a
-quantity, it is drawn as 0 or uniform up to its maximum. Signs and directions are random.
+Magnitudes (command speed and yaw rate, slope, push, CoM shift and wheel torque kicks) are
+drawn per stage as: 0 with `zero_probability` (stand still, flat ground, no push), in the
+band the stage added (from the previous stage's maximum up to this stage's) with
+`frontier_probability`, otherwise uniform below that band, so easier values keep being
+practised. If a stage does not raise a quantity, it is drawn as 0 or uniform up to its
+maximum. Signs and directions are random.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from self_balancing_robot.config import DEFAULT_REWARD_CONFIG, RewardConfig
 # left for balancing; 0.5 m/s left ~14% and v4 fell more). 0.3 m/s leaves headroom for the
 # speed bias a CoM shift causes: v8 with +1 cm drove ~0.15 m/s too fast, saturated the
 # motors at 0.4 m/s and fell.
-FULL_COMMAND = (0.3, 1.5)
+FULL_COMMAND = (0.5, 3.0)
 # Commands are redrawn every 3 to 5 s. A reversal (see `Stage.reversal_probability`) goes to
 # the opposite direction at this fraction to 100% of the stage's speed limit, no turning.
 COMMAND_RESAMPLE_S = (3.0, 5.0)
@@ -74,9 +74,6 @@ class Stage:
     push_max: float = 0.0
     push_interval_s: tuple[float, float] = (2.0, 4.0)
     push_duration_s: float = 0.1
-    # Constant torque on each wheel for the whole episode (N m), left and right drawn
-    # independently: motor and gearbox mismatch and drag (unequal ones make it turn).
-    wheel_torque_max: float = 0.0
     # Torque kicks on each wheel (N m), lasting `wheel_kick_duration_s`, one every
     # `wheel_kick_interval_s`: bumps and stiction.
     wheel_kick_max: float = 0.0
@@ -121,7 +118,8 @@ class Stage:
 # Learn to balance: zero command, flat ground, nominal physics, perfect sensors.
 BALANCE = Stage(name="balance", success_rate=0.95)
 
-# Learn to follow commands, the range growing in steps of 0.1 m/s (and 0.5 rad/s). Two fixed
+# Learn to follow commands, the range growing in fifths of FULL_COMMAND: steps of 0.1 m/s
+# (and 0.6 rad/s). Two fixed
 # ranges (0.05, then 0.4 m/s) let v5/v6 pass the first barely moving (~20% of the command)
 # and the second had to unlearn it. The first step stays at 0.1 m/s: starting from 0.05 m/s,
 # v7 never passed it, as at 0.05 m/s the speed signal is lost in balancing wobble and gearbox
@@ -131,21 +129,21 @@ BALANCE = Stage(name="balance", success_rate=0.95)
 # absolute error threshold that let v5 advance driving at ~60% of the command. Stops: with
 # speed and yaw rate each 0 at `zero_probability`, only ~1% of commands were (0, 0), the
 # most common command on the robot; v4 and v6 drifted standing still.
-# Sensor noise and latency grow alongside, in thirds: switched on together with everything
-# else at the first randomization stage (run 20261010-165211), survival there fell from
-# ~100% to 35% and the mean |pitch| rose from ~1 to 6.5 deg.
+# Sensor noise grows alongside in fifths and latency by one step at 0.2 and 0.4 m/s: switched
+# on together with everything else at the first randomization stage (run 20261010-165211),
+# survival there fell from ~100% to 35% and the mean |pitch| rose from ~1 to 6.5 deg.
 IMU_ANGLE_NOISE = 0.01
 IMU_RATE_NOISE = 0.05
 ENCODER_NOISE = 0.3
 COMMANDS_1 = replace(
     BALANCE,
     name="commands 0.1 m/s",
-    command_max=(0.1, 0.5),
+    command_max=(0.1, 0.6),
     reversal_probability=0.2,
     stop_probability=0.2,
-    imu_angle_noise=IMU_ANGLE_NOISE / 3,
-    imu_rate_noise=IMU_RATE_NOISE / 3,
-    encoder_noise=ENCODER_NOISE / 3,
+    imu_angle_noise=IMU_ANGLE_NOISE / 5,
+    imu_rate_noise=IMU_RATE_NOISE / 5,
+    encoder_noise=ENCODER_NOISE / 5,
     min_episodes=2_000,
     success_rate=0.95,
     speed_ratio=0.90,
@@ -155,17 +153,33 @@ COMMANDS_1 = replace(
 COMMANDS_2 = replace(
     COMMANDS_1,
     name="commands 0.2 m/s",
-    command_max=(0.2, 1.0),
+    command_max=(0.2, 1.2),
     max_latency_steps=1,
-    imu_angle_noise=IMU_ANGLE_NOISE * 2 / 3,
-    imu_rate_noise=IMU_RATE_NOISE * 2 / 3,
-    encoder_noise=ENCODER_NOISE * 2 / 3,
+    imu_angle_noise=IMU_ANGLE_NOISE * 2 / 5,
+    imu_rate_noise=IMU_RATE_NOISE * 2 / 5,
+    encoder_noise=ENCODER_NOISE * 2 / 5,
 )
 COMMANDS_3 = replace(
     COMMANDS_2,
     name="commands 0.3 m/s",
-    command_max=FULL_COMMAND,
+    command_max=(0.3, 1.8),
+    imu_angle_noise=IMU_ANGLE_NOISE * 3 / 5,
+    imu_rate_noise=IMU_RATE_NOISE * 3 / 5,
+    encoder_noise=ENCODER_NOISE * 3 / 5,
+)
+COMMANDS_4 = replace(
+    COMMANDS_3,
+    name="commands 0.4 m/s",
+    command_max=(0.4, 2.4),
     max_latency_steps=2,
+    imu_angle_noise=IMU_ANGLE_NOISE * 4 / 5,
+    imu_rate_noise=IMU_RATE_NOISE * 4 / 5,
+    encoder_noise=ENCODER_NOISE * 4 / 5,
+)
+COMMANDS_5 = replace(
+    COMMANDS_4,
+    name="commands 0.5 m/s",
+    command_max=FULL_COMMAND,
     imu_angle_noise=IMU_ANGLE_NOISE,
     imu_rate_noise=IMU_RATE_NOISE,
     encoder_noise=ENCODER_NOISE,
@@ -173,13 +187,12 @@ COMMANDS_3 = replace(
 
 # Full commands on an imperfect world. Mass, friction and battery voltage are on from the
 # first step (noise and latency already are); slope, pushes, the CoM shift and the wheel
-# torques grow in six equal steps up to 0.3 rad, 0.5 N, 8 mm, 0.01 N m offset and 0.02 N m
-# kicks.
+# torque kicks grow in six equal steps up to 0.3 rad, 0.5 N, 8 mm and 0.02 N m.
 # - Pushes: the robot weighs 0.27 kg, so a 0.1 s push of 1 N (the maximum up to v9) gave it
 #   ~0.37 m/s, more than the full command and ~70% of the wheel no-load speed (~0.53 m/s);
 #   0.5 N gives ~0.19 m/s.
-# - Wheel torques, against the 0.109 N m stall torque per motor: the offset is ~9% (as much
-#   as the modelled gearbox friction), the kicks ~18%.
+# - Wheel torque kicks: ~18% of the 0.109 N m stall torque per motor. There is no constant
+#   torque offset per wheel: the randomized battery voltage already scales the motor torque.
 # - Battery: a 3S LiPo goes from ~12.5 V charged down to ~10.5 V before cutoff, so the same
 #   PWM duty gives -5% to +13% of the nominal (11.1 V) motor speed and torque.
 # - Slopes: the base hits the ground at 0.5 rad of tilt relative to the surface, so above
@@ -192,22 +205,20 @@ COMMANDS_3 = replace(
 #   command. Standing still on slopes: v4 and v6 drifted at 0.07-0.10 m/s.
 PUSH_MAX = 0.5
 COM_OFFSET_MAX = 0.008
-WHEEL_TORQUE_MAX = 0.01
 WHEEL_KICK_MAX = 0.02
 RANDOMIZATION_1 = replace(
-    COMMANDS_3,
+    COMMANDS_5,
     name="randomization 1/6",
     slope_max=0.05,
     push_max=PUSH_MAX / 6,
     com_offset_max=COM_OFFSET_MAX / 6,
-    wheel_torque_max=WHEEL_TORQUE_MAX / 6,
     wheel_kick_max=WHEEL_KICK_MAX / 6,
     mass_fraction=0.10,
     friction_fraction=0.40,
     battery_voltage=(10.5, 12.5),
     min_episodes=5_000,
     success_rate=0.90,
-    speed_ratio=0.85,
+    speed_ratio=0.75,
     still_speed_limit=0.05,
 )
 RANDOMIZATION_2 = replace(
@@ -216,7 +227,6 @@ RANDOMIZATION_2 = replace(
     slope_max=0.10,
     push_max=PUSH_MAX * 2 / 6,
     com_offset_max=COM_OFFSET_MAX * 2 / 6,
-    wheel_torque_max=WHEEL_TORQUE_MAX * 2 / 6,
     wheel_kick_max=WHEEL_KICK_MAX * 2 / 6,
 )
 RANDOMIZATION_3 = replace(
@@ -225,7 +235,6 @@ RANDOMIZATION_3 = replace(
     slope_max=0.15,
     push_max=PUSH_MAX * 3 / 6,
     com_offset_max=COM_OFFSET_MAX * 3 / 6,
-    wheel_torque_max=WHEEL_TORQUE_MAX * 3 / 6,
     wheel_kick_max=WHEEL_KICK_MAX * 3 / 6,
 )
 RANDOMIZATION_4 = replace(
@@ -234,7 +243,6 @@ RANDOMIZATION_4 = replace(
     slope_max=0.20,
     push_max=PUSH_MAX * 4 / 6,
     com_offset_max=COM_OFFSET_MAX * 4 / 6,
-    wheel_torque_max=WHEEL_TORQUE_MAX * 4 / 6,
     wheel_kick_max=WHEEL_KICK_MAX * 4 / 6,
 )
 # The last two stages ask for smoother actions. Up to here the smoothness term cost < 1% of
@@ -248,7 +256,6 @@ RANDOMIZATION_5 = replace(
     slope_max=0.25,
     push_max=PUSH_MAX * 5 / 6,
     com_offset_max=COM_OFFSET_MAX * 5 / 6,
-    wheel_torque_max=WHEEL_TORQUE_MAX * 5 / 6,
     wheel_kick_max=WHEEL_KICK_MAX * 5 / 6,
     rewards=replace(DEFAULT_REWARD_CONFIG, smoothness_weight=5.0),
 )
@@ -258,9 +265,8 @@ RANDOMIZATION_6 = replace(
     slope_max=0.30,
     push_max=PUSH_MAX,
     com_offset_max=COM_OFFSET_MAX,
-    wheel_torque_max=WHEEL_TORQUE_MAX,
     wheel_kick_max=WHEEL_KICK_MAX,
-    rewards=replace(DEFAULT_REWARD_CONFIG, smoothness_weight=10.0),
+    rewards=replace(DEFAULT_REWARD_CONFIG, smoothness_weight=5.0),
 )
 
 CURRICULUM: tuple[Stage, ...] = (
@@ -268,6 +274,8 @@ CURRICULUM: tuple[Stage, ...] = (
     COMMANDS_1,
     COMMANDS_2,
     COMMANDS_3,
+    COMMANDS_4,
+    COMMANDS_5,
     RANDOMIZATION_1,
     RANDOMIZATION_2,
     RANDOMIZATION_3,
@@ -285,7 +293,6 @@ BANDED = {
     "slope": "slope_max",
     "push": "push_max",
     "com_offset": "com_offset_max",
-    "wheel_torque": "wheel_torque_max",
     "wheel_kick": "wheel_kick_max",
 }
 

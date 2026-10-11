@@ -32,7 +32,7 @@ from self_balancing_robot.envs.balance_env import (
 PITCH = 3  # index of pitch in a frame (actor history and privileged state)
 # Stages of the default curriculum used below.
 COMMANDS_LOW = "commands 0.1 m/s"
-COMMANDS_FULL = "commands 0.3 m/s"
+COMMANDS_FULL = "commands 0.5 m/s"
 RANDOMIZED = "randomization 1/6"
 LAST = -1
 
@@ -185,13 +185,10 @@ def test_physics_is_randomized_only_where_the_stage_says_so(env):
         info = reset(env, seed=8, stage=stage).info
         assert info["mass_scale"] == 1.0 and info["friction_scale"] == 1.0
         assert np.all(info["com_offset"] == 0.0) and info["ground_normal"][2] == 1.0
-        assert np.all(info["wheel_torque"] == 0.0)
         assert np.isclose(info["battery_voltage"], NOMINAL_VOLTAGE)
     assert reset(env, seed=8, stage="balance").info["motor_latency"] == 0
     info = reset(env, seed=8, stage=LAST).info
     assert info["mass_scale"] != 1.0 and info["friction_scale"] != 1.0
-    left, right = info["wheel_torque"]
-    assert left != 0.0 and right != 0.0 and left != right
     assert info["ground_normal"][2] < 1.0
     model = env._episode_model(info)
     base = env._base_body_id
@@ -219,8 +216,6 @@ def test_samples_stay_within_each_stages_maxima(env):
         assert np.all(np.abs(info["command"]) <= np.array(stage.command_max) + 1e-6), stage.name
         assert np.all(np.abs(info["slope"]) <= stage.slope_max + 1e-6), stage.name
         assert np.all(np.abs(info["com_offset"]) <= stage.com_offset_max + 1e-6), stage.name
-        assert info["wheel_torque"].shape == (50, 2), stage.name
-        assert np.all(np.abs(info["wheel_torque"]) <= stage.wheel_torque_max + 1e-6), stage.name
         assert np.all(np.abs(info["mass_scale"] - 1) <= stage.mass_fraction + 1e-6), stage.name
         low, high = stage.battery_voltage
         voltage = info["battery_voltage"]
@@ -319,12 +314,11 @@ def test_battery_voltage_scales_motor_speed_and_torque(env):
     assert wheel_speeds[1] > wheel_speeds[0] > 0.0
 
 
-def test_wheel_torques_act_on_the_wheel_joints(env):
-    """The episode's torque offset is applied all the time, a kick on top while it lasts."""
+def test_wheel_kicks_act_on_the_wheel_joints(env):
+    """A kick is applied as a torque on the wheel joints while it lasts, nothing otherwise."""
     stage = CURRICULUM[LAST]
     state = set_info(
         reset(env, seed=4, stage=LAST),
-        wheel_torque=[0.004, -0.006],
         next_wheel_kick_time=0.05,
         next_impulse_time=1e3,
     )
@@ -334,8 +328,7 @@ def test_wheel_torques_act_on_the_wheel_joints(env):
         state = step(env, state)
         assert not state.done
         applied = state.data.qfrc_applied[wheels]
-        expected = np.array([0.004, -0.006]) + state.info["wheel_kick"]
-        np.testing.assert_allclose(applied, expected, atol=1e-7)
+        np.testing.assert_allclose(applied, state.info["wheel_kick"], atol=1e-7)
         kicks.append(np.any(state.info["wheel_kick"] != 0.0))
     # Steps 1-4 (t = 0..0.03 s) before the kick at 0.05 s, which lasts wheel_kick_duration_s.
     assert not any(kicks[:5])

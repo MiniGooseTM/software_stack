@@ -366,7 +366,7 @@ def main() -> None:
         "--stage",
         default="-1",
         help="Curriculum stage to simulate, by name or index (default -1, the last: noise, "
-        'latency, slopes and pushes; "commands 0.3 m/s" for a clean simulation). Stages: '
+        'latency, slopes and pushes; "commands 0.5 m/s" for a clean simulation). Stages: '
         + ", ".join(f'{i} "{s.name}"' for i, s in enumerate(CURRICULUM)),
     )
     parser.add_argument("--render-every", type=int, default=2, help="Render every N control steps.")
