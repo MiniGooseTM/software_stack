@@ -43,6 +43,7 @@ class TrainingMetricsCallback(BaseCallback):
         max_eval_steps: int = DEFAULT_TRAINING_CONFIG.evaluation_max_steps,
         seed: int = 0,
         plot_dir: Path = PLOT_DIR,
+        domain_randomization: bool = True,
     ):
         super().__init__()
         if eval_freq <= 0:
@@ -57,7 +58,7 @@ class TrainingMetricsCallback(BaseCallback):
         self.max_eval_steps = max_eval_steps
         self.seed = seed
         self.plot_dir = plot_dir
-        self.eval_env = SelfBalancingRobotEnv()
+        self.eval_env = SelfBalancingRobotEnv(domain_randomization=domain_randomization)
         self.history: dict[str, list] = defaultdict(list)
         self._train_sums: dict[str, float] = defaultdict(float)
         self._train_count = 0
@@ -152,6 +153,7 @@ class EvaluationVideoCallback(BaseCallback):
         max_steps: int = DEFAULT_TRAINING_CONFIG.evaluation_max_steps,
         seed: int = 0,
         verbose: int = 0,
+        domain_randomization: bool = True,
     ):
         super().__init__(verbose)
         if video_freq <= 0:
@@ -160,7 +162,9 @@ class EvaluationVideoCallback(BaseCallback):
         self.video_dir = video_dir
         self.max_steps = max_steps
         self.seed = seed
-        self.video_env = SelfBalancingRobotEnv(render_mode="rgb_array")
+        self.video_env = SelfBalancingRobotEnv(
+            render_mode="rgb_array", domain_randomization=domain_randomization
+        )
         self._next_video_step = video_freq
 
     def _on_step(self) -> bool:

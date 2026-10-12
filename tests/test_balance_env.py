@@ -14,7 +14,10 @@ from self_balancing_robot.metrics import (
     summarize,
 )
 from self_balancing_robot.policy import AsymmetricActorCriticPolicy
-from self_balancing_robot.training_callback import TrainingMetricsCallback
+from self_balancing_robot.training_callback import (
+    EvaluationVideoCallback,
+    TrainingMetricsCallback,
+)
 
 
 def _set_pitch(env, pitch):
@@ -96,6 +99,19 @@ def test_training_start_replaces_old_plot_with_current_run(tmp_path):
 
     assert plot_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert not callback.history
+
+
+def test_training_evaluation_callbacks_use_training_randomization_setting():
+    metrics_callback = TrainingMetricsCallback(domain_randomization=False)
+    video_callback = None
+    try:
+        video_callback = EvaluationVideoCallback(domain_randomization=False)
+        assert metrics_callback.eval_env.domain_randomization is False
+        assert video_callback.video_env.domain_randomization is False
+    finally:
+        metrics_callback.eval_env.close()
+        if video_callback is not None:
+            video_callback.video_env.close()
 
 
 class _ZeroPolicy:

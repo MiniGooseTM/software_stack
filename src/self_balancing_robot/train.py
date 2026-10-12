@@ -28,6 +28,13 @@ def main() -> None:
     parser.add_argument("--eval-episodes", type=int, default=cfg.evaluation_episodes)
     parser.add_argument("--video-freq", type=int, default=cfg.video_frequency)
     parser.add_argument(
+        "--domain-randomization",
+        choices=("none", "full"),
+        default="full",
+        help="Keep stage-3 difficulty but disable randomized physics, sensor noise, pushes, "
+        "and latency with 'none'.",
+    )
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -56,7 +63,10 @@ def main() -> None:
         n_envs=args.n_envs,
         seed=args.seed,
         vec_env_cls=SubprocVecEnv if args.n_envs > 1 else DummyVecEnv,
-        env_kwargs={"curriculum_stage": args.start_stage},
+        env_kwargs={
+            "curriculum_stage": args.start_stage,
+            "domain_randomization": args.domain_randomization == "full",
+        },
     )
     env.env_method("set_difficulty_level", args.start_level)
     if args.resume is not None:
@@ -97,10 +107,12 @@ def main() -> None:
                 eval_freq=args.eval_freq,
                 n_eval_episodes=args.eval_episodes,
                 seed=args.seed + cfg.evaluation_seed_offset,
+                domain_randomization=args.domain_randomization == "full",
             ),
             EvaluationVideoCallback(
                 video_freq=args.video_freq,
                 seed=args.seed + cfg.evaluation_seed_offset,
+                domain_randomization=args.domain_randomization == "full",
                 verbose=1,
             ),
             CheckpointCallback(
@@ -117,6 +129,7 @@ def main() -> None:
     )
     model.save(args.output)
     # Needed for --start-stage when resuming from this model.
+    print(f"Domain randomization: {args.domain_randomization}")
     print(f"Curriculum stages at the end: {env.get_attr('curriculum_stage')}")
     print(f"Levels at the end: {env.get_attr('difficulty_level')}")
     env.close()
