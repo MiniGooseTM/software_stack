@@ -28,6 +28,11 @@ def main() -> None:
     parser.add_argument("--eval-episodes", type=int, default=cfg.evaluation_episodes)
     parser.add_argument("--video-freq", type=int, default=cfg.video_frequency)
     parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Disable periodic and final evaluation video recording (useful on headless servers).",
+    )
+    parser.add_argument(
         "--domain-randomization",
         choices=("none", "full"),
         default="full",
@@ -101,27 +106,31 @@ def main() -> None:
             device="cpu",
             tensorboard_log="logs",
         )
-    callback = CallbackList(
-        [
-            TrainingMetricsCallback(
-                eval_freq=args.eval_freq,
-                n_eval_episodes=args.eval_episodes,
-                seed=args.seed + cfg.evaluation_seed_offset,
-                domain_randomization=args.domain_randomization == "full",
-            ),
+    callbacks = [
+        TrainingMetricsCallback(
+            eval_freq=args.eval_freq,
+            n_eval_episodes=args.eval_episodes,
+            seed=args.seed + cfg.evaluation_seed_offset,
+            domain_randomization=args.domain_randomization == "full",
+        ),
+    ]
+    if not args.no_video:
+        callbacks.append(
             EvaluationVideoCallback(
                 video_freq=args.video_freq,
                 seed=args.seed + cfg.evaluation_seed_offset,
                 domain_randomization=args.domain_randomization == "full",
                 verbose=1,
-            ),
-            CheckpointCallback(
-                save_freq=max(cfg.checkpoint_frequency // args.n_envs, 1),
-                save_path=str(cfg.checkpoint_path),
-                name_prefix="ppo_balance",
-            ),
-        ]
+            )
+        )
+    callbacks.append(
+        CheckpointCallback(
+            save_freq=max(cfg.checkpoint_frequency // args.n_envs, 1),
+            save_path=str(cfg.checkpoint_path),
+            name_prefix="ppo_balance",
+        )
     )
+    callback = CallbackList(callbacks)
     model.learn(
         total_timesteps=args.timesteps,
         callback=callback,

@@ -39,8 +39,9 @@ explicitly and save to a separate model path:
 `make train TRAIN_ARGS="--domain-randomization none --output models/ppo_balance_no_dr.zip"`.
 This still trains through stages 1 and 2 and reaches stage 3; at stage 3 it retains the full
 command range while keeping mass, CoM, friction, slope, pushes, sensor noise and latency nominal/off.
-The evaluation and video callbacks use the same setting. Domain-randomization choice is not stored
-in PPO checkpoints, so pass the same flag when resuming a run.
+The evaluation and video callbacks use the same setting. Use `--no-video` on headless servers to
+skip video recording that requires an OpenGL context. Domain-randomization choice is not stored in
+PPO checkpoints, so pass the same flag when resuming a run.
 Training also evaluates held-out episodes at the current curriculum stage and writes to `src/plots/`:
 `training_metrics.png` (train vs eval reward, survival, velocity and yaw-rate tracking error, mean
 |pitch| and curriculum stage over timesteps) and `eval_episode_latest.png` / `eval_episode_final.png`
