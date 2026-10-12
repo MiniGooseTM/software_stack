@@ -32,7 +32,7 @@ from self_balancing_robot.envs.balance_env import (
 PITCH = 3  # index of pitch in a frame (actor history and privileged state)
 # Stages of the default curriculum used below.
 COMMANDS_LOW = "commands 0.1 m/s"
-COMMANDS_FULL = "commands 0.5 m/s"
+COMMANDS_FULL = "commands 0.4 m/s"
 RANDOMIZED = "randomization 1/6"
 LAST = -1
 
@@ -111,7 +111,7 @@ def test_reward_components_follow_the_stages_weights(env, stage):
 
 def test_last_stages_weigh_smoothness_more():
     weights = [stage.rewards.smoothness_weight for stage in CURRICULUM]
-    assert weights[-2:] == [5.0, 10.0]
+    assert weights[-2:] == [5.0, 5.0]
     assert all(w == RewardConfig().smoothness_weight for w in weights[:-2])
 
 

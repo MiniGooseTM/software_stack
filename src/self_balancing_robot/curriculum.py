@@ -31,8 +31,10 @@ from self_balancing_robot.config import DEFAULT_REWARD_CONFIG, RewardConfig
 # `SelfBalancingRobotEnv.wheel_feasible_command`). Up to v8 it was 0.4 m/s (~30% motor torque
 # left for balancing; 0.5 m/s left ~14% and v4 fell more). 0.3 m/s leaves headroom for the
 # speed bias a CoM shift causes: v8 with +1 cm drove ~0.15 m/s too fast, saturated the
-# motors at 0.4 m/s and fell.
-FULL_COMMAND = (0.5, 3.0)
+# motors at 0.4 m/s and fell. 0.5 m/s and 3.0 rad/s (94% of the goose robot's 0.53 m/s
+# no-load wheel speed) stalled at randomization 3/6 (run 20261011-162254, 59% survival at the
+# last stage); 0.4 m/s and 2.5 rad/s finished the curriculum (run 20261011-232238).
+FULL_COMMAND = (0.4, 2.5)
 # Commands are redrawn every 3 to 5 s. A reversal (see `Stage.reversal_probability`) goes to
 # the opposite direction at this fraction to 100% of the stage's speed limit, no turning.
 COMMAND_RESAMPLE_S = (3.0, 5.0)
@@ -118,8 +120,8 @@ class Stage:
 # Learn to balance: zero command, flat ground, nominal physics, perfect sensors.
 BALANCE = Stage(name="balance", success_rate=0.95)
 
-# Learn to follow commands, the range growing in fifths of FULL_COMMAND: steps of 0.1 m/s
-# (and 0.6 rad/s). Two fixed
+# Learn to follow commands, the range growing in quarters of FULL_COMMAND: steps of 0.1 m/s
+# (and 0.625 rad/s). Two fixed
 # ranges (0.05, then 0.4 m/s) let v5/v6 pass the first barely moving (~20% of the command)
 # and the second had to unlearn it. The first step stays at 0.1 m/s: starting from 0.05 m/s,
 # v7 never passed it, as at 0.05 m/s the speed signal is lost in balancing wobble and gearbox
@@ -129,7 +131,7 @@ BALANCE = Stage(name="balance", success_rate=0.95)
 # absolute error threshold that let v5 advance driving at ~60% of the command. Stops: with
 # speed and yaw rate each 0 at `zero_probability`, only ~1% of commands were (0, 0), the
 # most common command on the robot; v4 and v6 drifted standing still.
-# Sensor noise grows alongside in fifths and latency by one step at 0.2 and 0.4 m/s: switched
+# Sensor noise grows alongside in quarters and latency by one step at 0.2 and 0.4 m/s: switched
 # on together with everything else at the first randomization stage (run 20261010-165211),
 # survival there fell from ~100% to 35% and the mean |pitch| rose from ~1 to 6.5 deg.
 IMU_ANGLE_NOISE = 0.01
@@ -138,12 +140,12 @@ ENCODER_NOISE = 0.3
 COMMANDS_1 = replace(
     BALANCE,
     name="commands 0.1 m/s",
-    command_max=(0.1, 0.6),
+    command_max=(0.1, 0.625),
     reversal_probability=0.2,
     stop_probability=0.2,
-    imu_angle_noise=IMU_ANGLE_NOISE / 5,
-    imu_rate_noise=IMU_RATE_NOISE / 5,
-    encoder_noise=ENCODER_NOISE / 5,
+    imu_angle_noise=IMU_ANGLE_NOISE / 4,
+    imu_rate_noise=IMU_RATE_NOISE / 4,
+    encoder_noise=ENCODER_NOISE / 4,
     min_episodes=2_000,
     success_rate=0.95,
     speed_ratio=0.90,
@@ -153,33 +155,25 @@ COMMANDS_1 = replace(
 COMMANDS_2 = replace(
     COMMANDS_1,
     name="commands 0.2 m/s",
-    command_max=(0.2, 1.2),
+    command_max=(0.2, 1.25),
     max_latency_steps=1,
-    imu_angle_noise=IMU_ANGLE_NOISE * 2 / 5,
-    imu_rate_noise=IMU_RATE_NOISE * 2 / 5,
-    encoder_noise=ENCODER_NOISE * 2 / 5,
+    imu_angle_noise=IMU_ANGLE_NOISE * 2 / 4,
+    imu_rate_noise=IMU_RATE_NOISE * 2 / 4,
+    encoder_noise=ENCODER_NOISE * 2 / 4,
 )
 COMMANDS_3 = replace(
     COMMANDS_2,
     name="commands 0.3 m/s",
-    command_max=(0.3, 1.8),
-    imu_angle_noise=IMU_ANGLE_NOISE * 3 / 5,
-    imu_rate_noise=IMU_RATE_NOISE * 3 / 5,
-    encoder_noise=ENCODER_NOISE * 3 / 5,
+    command_max=(0.3, 1.875),
+    imu_angle_noise=IMU_ANGLE_NOISE * 3 / 4,
+    imu_rate_noise=IMU_RATE_NOISE * 3 / 4,
+    encoder_noise=ENCODER_NOISE * 3 / 4,
 )
 COMMANDS_4 = replace(
     COMMANDS_3,
     name="commands 0.4 m/s",
-    command_max=(0.4, 2.4),
-    max_latency_steps=2,
-    imu_angle_noise=IMU_ANGLE_NOISE * 4 / 5,
-    imu_rate_noise=IMU_RATE_NOISE * 4 / 5,
-    encoder_noise=ENCODER_NOISE * 4 / 5,
-)
-COMMANDS_5 = replace(
-    COMMANDS_4,
-    name="commands 0.5 m/s",
     command_max=FULL_COMMAND,
+    max_latency_steps=2,
     imu_angle_noise=IMU_ANGLE_NOISE,
     imu_rate_noise=IMU_RATE_NOISE,
     encoder_noise=ENCODER_NOISE,
@@ -207,7 +201,7 @@ PUSH_MAX = 0.5
 COM_OFFSET_MAX = 0.008
 WHEEL_KICK_MAX = 0.02
 RANDOMIZATION_1 = replace(
-    COMMANDS_5,
+    COMMANDS_4,
     name="randomization 1/6",
     slope_max=0.05,
     push_max=PUSH_MAX / 6,
@@ -275,7 +269,6 @@ CURRICULUM: tuple[Stage, ...] = (
     COMMANDS_2,
     COMMANDS_3,
     COMMANDS_4,
-    COMMANDS_5,
     RANDOMIZATION_1,
     RANDOMIZATION_2,
     RANDOMIZATION_3,

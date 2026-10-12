@@ -16,16 +16,16 @@ from self_balancing_robot.curriculum import (
 
 
 def test_default_curriculum_keeps_the_tuned_progression():
-    """Balance, commands in fifths of the full range (sensor noise and latency growing
+    """Balance, commands in quarters of the full range (sensor noise and latency growing
     alongside), then slope, push, CoM shift and wheel kicks in sixths of their maxima."""
     names = [stage.name for stage in CURRICULUM]
-    assert names[0] == "balance" and len(names) == 12
+    assert names[0] == "balance" and len(names) == 11
     commands = [stage.command_max for stage in CURRICULUM]
     np.testing.assert_allclose(
-        commands[1:6], [np.multiply(FULL_COMMAND, k / 5) for k in range(1, 6)]
+        commands[1:5], [np.multiply(FULL_COMMAND, k / 4) for k in range(1, 5)]
     )
-    assert all(command == FULL_COMMAND for command in commands[6:])
-    randomized = CURRICULUM[6:]
+    assert all(command == FULL_COMMAND for command in commands[5:])
+    randomized = CURRICULUM[5:]
     for k, stage in enumerate(randomized, start=1):
         assert np.isclose(stage.slope_max, k / 6 * 0.3)
         assert np.isclose(stage.push_max, k / 6 * 0.5)
@@ -34,10 +34,10 @@ def test_default_curriculum_keeps_the_tuned_progression():
         assert (stage.mass_fraction, stage.friction_fraction) == (0.10, 0.40)
         assert stage.battery_voltage == (10.5, 12.5)
         assert stage.max_latency_steps == 2 and stage.imu_angle_noise > 0
-        assert (stage.min_episodes, stage.success_rate, stage.speed_ratio) == (5_000, 0.90, 0.85)
+        assert (stage.min_episodes, stage.success_rate, stage.speed_ratio) == (5_000, 0.90, 0.75)
         assert stage.still_speed_limit == 0.05 and stage.reversal_success_rate == 0.85
     full_noise = CURRICULUM[-1].imu_angle_noise, CURRICULUM[-1].encoder_noise
-    for k, stage in enumerate(CURRICULUM[1:6], start=1):
+    for k, stage in enumerate(CURRICULUM[1:5], start=1):
         assert (stage.min_episodes, stage.success_rate, stage.speed_ratio) == (2_000, 0.95, 0.90)
         assert stage.still_speed_limit == 0.02 and stage.reversal_probability == 0.2
         assert stage.stop_probability == 0.2
@@ -45,7 +45,7 @@ def test_default_curriculum_keeps_the_tuned_progression():
         assert stage.wheel_kick_max == 0
         assert stage.max_latency_steps == k // 2
         noise = stage.imu_angle_noise, stage.encoder_noise
-        np.testing.assert_allclose(noise, np.multiply(full_noise, k / 5))
+        np.testing.assert_allclose(noise, np.multiply(full_noise, k / 4))
     assert BALANCE.imu_angle_noise == 0 and BALANCE.max_latency_steps == 0
     assert BALANCE.speed_ratio is None and BALANCE.command_max == (0.0, 0.0)
 
@@ -53,12 +53,12 @@ def test_default_curriculum_keeps_the_tuned_progression():
 def test_band_floors_come_from_the_previous_stage():
     table = stage_table(CURRICULUM)
     # Command steps sample their new third; once the range stops growing, 0 or uniform.
-    floors = [(0, 0), (0, 0), (0.1, 0.6), (0.2, 1.2), (0.3, 1.8), (0.4, 2.4), (0, 0)]
-    np.testing.assert_allclose(table["command_floor"][:7], floors, atol=1e-6)
-    assert np.all(table["command_floor"][6:] == 0)
-    np.testing.assert_allclose(table["slope_floor"][6:], np.arange(6) / 6 * 0.3, atol=1e-6)
-    np.testing.assert_allclose(table["push_floor"][6:], np.arange(6) / 6 * 0.5, atol=1e-6)
-    np.testing.assert_allclose(table["wheel_kick_floor"][6:], np.arange(6) / 6 * 0.02, atol=1e-6)
+    floors = [(0, 0), (0, 0), (0.1, 0.625), (0.2, 1.25), (0.3, 1.875), (0, 0)]
+    np.testing.assert_allclose(table["command_floor"][:6], floors, atol=1e-6)
+    assert np.all(table["command_floor"][5:] == 0)
+    np.testing.assert_allclose(table["slope_floor"][5:], np.arange(6) / 6 * 0.3, atol=1e-6)
+    np.testing.assert_allclose(table["push_floor"][5:], np.arange(6) / 6 * 0.5, atol=1e-6)
+    np.testing.assert_allclose(table["wheel_kick_floor"][5:], np.arange(6) / 6 * 0.02, atol=1e-6)
 
 
 def test_reward_settings_get_a_column_per_stage():
@@ -78,7 +78,7 @@ def test_unchecked_criteria_always_pass_in_the_table():
 
 def test_stages_are_found_by_name_or_index():
     assert stage_index(CURRICULUM, "balance") == 0
-    assert stage_index(CURRICULUM, "commands 0.5 m/s") == 5
+    assert stage_index(CURRICULUM, "commands 0.4 m/s") == 4
     assert stage_index(CURRICULUM, 2) == 2
     assert stage_index(CURRICULUM, "-1") == len(CURRICULUM) - 1
     with pytest.raises(ValueError, match="no stage"):
@@ -111,6 +111,6 @@ def test_a_new_stage_needs_only_a_list_entry():
     curriculum = (*CURRICULUM[:3], halfway, *CURRICULUM[3:])
     table = stage_table(curriculum)
     assert len(table["success_rate"]) == len(CURRICULUM) + 1
-    np.testing.assert_allclose(table["command_floor"][3], (0.2, 1.2))
+    np.testing.assert_allclose(table["command_floor"][3], (0.2, 1.25))
     np.testing.assert_allclose(table["command_floor"][4], (0.25, 1.5))
     assert isinstance(curriculum[3], Stage)
