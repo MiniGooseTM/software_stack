@@ -34,7 +34,7 @@ def test_default_curriculum_keeps_the_tuned_progression():
         assert (stage.mass_fraction, stage.friction_fraction) == (0.10, 0.40)
         assert stage.battery_voltage == (10.5, 12.5)
         assert stage.max_latency_steps == 2 and stage.imu_angle_noise > 0
-        assert (stage.min_episodes, stage.success_rate, stage.speed_ratio) == (5_000, 0.90, 0.75)
+        assert (stage.min_episodes, stage.success_rate, stage.speed_ratio) == (5_000, 0.90, 0.90)
         assert stage.still_speed_limit == 0.05 and stage.reversal_success_rate == 0.85
     full_noise = CURRICULUM[-1].imu_angle_noise, CURRICULUM[-1].encoder_noise
     for k, stage in enumerate(CURRICULUM[1:5], start=1):

@@ -194,9 +194,10 @@ COMMANDS_4 = replace(
 # - CoM: the nominal CoM is 4.9 cm above the axle. Up to v7 the shift was 4.9 mm from the
 #   start, and v7 still drifted at 0.1 m/s standing still with 5 mm forward and fell with
 #   1 cm; v8 (1 cm) stalled with 5-7 mm. 8 mm needs ~9 deg of lean to balance.
-# - Test: slopes cost speed uphill (at 0.3 rad, 0.4 m/s took almost full duty), so the speed
-#   ratio is a bit lower; v6 (85% survival, no speed check) drifted back to ~70% of the
-#   command. Standing still on slopes: v4 and v6 drifted at 0.07-0.10 m/s.
+# - Test: the speed ratio stays at 0.90 as in the command stages, although slopes cost speed
+#   uphill (at 0.3 rad, 0.4 m/s took almost full duty); v6 (85% survival, no speed check)
+#   drifted back to ~70% of the command. Standing still on slopes: v4 and v6 drifted at
+#   0.07-0.10 m/s.
 PUSH_MAX = 0.5
 COM_OFFSET_MAX = 0.008
 WHEEL_KICK_MAX = 0.02
@@ -212,7 +213,7 @@ RANDOMIZATION_1 = replace(
     battery_voltage=(10.5, 12.5),
     min_episodes=5_000,
     success_rate=0.90,
-    speed_ratio=0.75,
+    speed_ratio=0.90,
     still_speed_limit=0.05,
 )
 RANDOMIZATION_2 = replace(
