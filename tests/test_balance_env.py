@@ -364,17 +364,28 @@ def test_curriculum_ramps_commands_then_reaches_domain_randomization():
 def test_commands_stay_within_wheel_speed():
     env = SelfBalancingRobotEnv(curriculum_stage=2)
     env.set_difficulty_level(env.max_level)
+    assert env.curriculum_config.command_limits == (0.4, 2.5)
     full_speed = env.curriculum_config.command_limits[0]
     for seed in range(200):
         env.reset(seed=seed)
         linear, angular = env.command
         assert abs(linear) + abs(angular) * env._half_track <= full_speed + 1e-9
-    env.hold_command(full_speed, -1.5)  # joystick corner: both scaled, direction kept
+    angular_limit = env.curriculum_config.command_limits[1]
+    env.hold_command(full_speed, -angular_limit)  # corner scales both, preserving direction
     linear, angular = env.command
     assert np.isclose(abs(linear) + abs(angular) * env._half_track, full_speed)
-    assert np.isclose(angular / linear, -1.5 / full_speed)
+    assert np.isclose(angular / linear, -angular_limit / full_speed)
     env.hold_command(0.2, 0.5)  # already feasible: unchanged
     np.testing.assert_allclose(env.command, [0.2, 0.5])
+    env.close()
+
+
+def test_actor_command_scaling_uses_new_full_command_limits():
+    env = SelfBalancingRobotEnv(curriculum_stage=3, domain_randomization=False)
+    env.hold_command(0.4, 0.0)
+    np.testing.assert_allclose(env._scaled_command(), [1.0, 0.0])
+    env.hold_command(0.0, 2.5)
+    np.testing.assert_allclose(env._scaled_command(), [0.0, 1.0])
     env.close()
 
 

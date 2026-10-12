@@ -40,12 +40,9 @@ class RewardConfig:
 class CurriculumConfig:
     command_resample_seconds: tuple[float, float] = (3.0, 5.0)
     stage1_timeout_success_rate: float = 0.95
-    # Full command range (v m/s, omega rad/s). Up to v8 it was 0.4 m/s (~30% motor torque
-    # left for balancing; 0.5 m/s left ~14% and v4 fell more). 0.3 m/s leaves headroom for
-    # the speed bias a CoM shift causes: v8 with +1 cm drove ~0.15 m/s too fast, saturated
-    # the motors at 0.4 m/s and fell. Commands are also scaled down so the outer wheel never
-    # needs more than the full speed (see `wheel_feasible_command`).
-    command_limits: tuple[float, float] = (0.3, 1.5)
+    # Full command range (v m/s, omega rad/s). Commands are also scaled down so the outer
+    # wheel never needs more than the full linear speed (see `wheel_feasible_command`).
+    command_limits: tuple[float, float] = (0.4, 2.5)
 
     # Stages 2 and 3 have levels 1..N. Stage 2 level k allows commands up to k/N of
     # `command_limits`; stage 3 level k allows slopes up to k/N * slope_radians and pushes up
@@ -72,10 +69,8 @@ class CurriculumConfig:
     #    `speed_ratio_settle_seconds` (the acceleration after each new command is ignored);
     #  - stood still on zero speed commands: mean |v| at most the step's still-speed limit
     #    (stricter on flat ground; on slopes v4 and v6 drifted at 0.07-0.10 m/s).
-    # 3 levels: 0.1, 0.2, 0.3 m/s (v7/v8: 4 levels to 0.4 m/s). The first level stays at
-    # 0.1 m/s: with 8 levels (from 0.05 m/s) v7 never passed level 1, as at 0.05 m/s the
-    # speed signal is lost in balancing wobble and gearbox friction and the policy drifted
-    # back to standing still (36% -> 4% of the command from 3M to 5M steps).
+    # Three levels scale the current command limit by 1/3, 2/3 and 1. The first level
+    # remains above 0.05 m/s, where speed signal is lost in balancing wobble and friction.
     command_levels: int = 3
     command_level_success_rate: float = 0.95
     command_min_episodes_per_level: int = 40
