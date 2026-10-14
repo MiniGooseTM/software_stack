@@ -10,6 +10,7 @@ import pytest
 from brax.training.acme import running_statistics, specs
 
 from self_balancing_robot.actor import network_factory
+from self_balancing_robot.curriculum import RANDOMIZED_CURRICULUM
 from self_balancing_robot.envs.balance_env import (
     ACTOR_KEY,
     CRITIC_KEY,
@@ -20,7 +21,11 @@ from self_balancing_robot.envs.balance_env import (
 
 @functools.cache
 def make_env(**kwargs) -> SelfBalancingRobotEnv:
-    """One environment (and one compilation) per configuration for the whole test session."""
+    """One environment (and one compilation) per configuration for the whole test session.
+
+    The tests exercise the randomized curriculum, whether or not training uses it
+    (`curriculum.DOMAIN_RANDOMIZATION`)."""
+    kwargs.setdefault("curriculum", RANDOMIZED_CURRICULUM)
     return SelfBalancingRobotEnv(**kwargs)
 
 

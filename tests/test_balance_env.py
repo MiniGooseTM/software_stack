@@ -10,13 +10,13 @@ from conftest import make_env, persistent, reset, set_info, step
 from self_balancing_robot.config import RewardConfig
 from self_balancing_robot.curriculum import (
     BALANCE,
-    CURRICULUM,
     FULL_COMMAND,
     NOMINAL_VOLTAGE,
     RANDOMIZATION_1,
     REVERSAL_MIN_FRACTION,
     SPEED_RATIO_SETTLE_S,
 )
+from self_balancing_robot.curriculum import RANDOMIZED_CURRICULUM as CURRICULUM
 from self_balancing_robot.envs.balance_env import (
     ACTOR_FRAME_SIZE,
     ACTOR_KEY,

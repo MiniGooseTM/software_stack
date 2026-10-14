@@ -264,7 +264,7 @@ RANDOMIZATION_6 = replace(
     rewards=replace(DEFAULT_REWARD_CONFIG, smoothness_weight=5.0),
 )
 
-CURRICULUM: tuple[Stage, ...] = (
+RANDOMIZED_CURRICULUM: tuple[Stage, ...] = (
     BALANCE,
     COMMANDS_1,
     COMMANDS_2,
@@ -276,6 +276,38 @@ CURRICULUM: tuple[Stage, ...] = (
     RANDOMIZATION_4,
     RANDOMIZATION_5,
     RANDOMIZATION_6,
+)
+
+
+def without_randomization(stage: Stage) -> Stage:
+    """The stage on nominal physics with perfect sensors: flat ground, no pushes or wheel kicks,
+    nominal CoM, mass, friction and battery voltage, no latency or noise. Commands (with
+    reversals and stops), rewards and the test to leave the stage are unchanged."""
+    return replace(
+        stage,
+        slope_max=0.0,
+        push_max=0.0,
+        wheel_kick_max=0.0,
+        com_offset_max=0.0,
+        mass_fraction=0.0,
+        friction_fraction=0.0,
+        battery_voltage=(NOMINAL_VOLTAGE, NOMINAL_VOLTAGE),
+        max_latency_steps=0,
+        imu_angle_noise=0.0,
+        imu_rate_noise=0.0,
+        encoder_noise=0.0,
+    )
+
+
+# Baseline without domain randomization, to compare against the randomized training: the same
+# stages (names, commands, rewards and tests; the "randomization k/6" stages differ only in
+# the smoothness weight), all on nominal physics with perfect sensors. True trains on
+# RANDOMIZED_CURRICULUM.
+DOMAIN_RANDOMIZATION = False
+CURRICULUM: tuple[Stage, ...] = (
+    RANDOMIZED_CURRICULUM
+    if DOMAIN_RANDOMIZATION
+    else tuple(without_randomization(stage) for stage in RANDOMIZED_CURRICULUM)
 )
 
 

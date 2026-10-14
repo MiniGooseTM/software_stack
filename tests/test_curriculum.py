@@ -6,13 +6,16 @@ import pytest
 from self_balancing_robot.config import RewardConfig
 from self_balancing_robot.curriculum import (
     BALANCE,
-    CURRICULUM,
+    DOMAIN_RANDOMIZATION,
     FULL_COMMAND,
     Stage,
     stage_index,
     stage_table,
     validate,
+    without_randomization,
 )
+from self_balancing_robot.curriculum import CURRICULUM as TRAINING_CURRICULUM
+from self_balancing_robot.curriculum import RANDOMIZED_CURRICULUM as CURRICULUM
 
 
 def test_default_curriculum_keeps_the_tuned_progression():
@@ -114,3 +117,30 @@ def test_a_new_stage_needs_only_a_list_entry():
     np.testing.assert_allclose(table["command_floor"][3], (0.2, 1.25))
     np.testing.assert_allclose(table["command_floor"][4], (0.25, 1.5))
     assert isinstance(curriculum[3], Stage)
+
+
+def test_training_curriculum_follows_the_randomization_switch():
+    """Without randomization: the same stages, commands, rewards and tests, nothing random."""
+    assert len(TRAINING_CURRICULUM) == len(CURRICULUM)
+    if DOMAIN_RANDOMIZATION:
+        assert TRAINING_CURRICULUM == CURRICULUM
+        return
+    for plain, randomized in zip(TRAINING_CURRICULUM, CURRICULUM):
+        assert plain == without_randomization(randomized)
+        assert (plain.name, plain.command_max, plain.rewards) == (
+            randomized.name,
+            randomized.command_max,
+            randomized.rewards,
+        )
+        assert (plain.success_rate, plain.speed_ratio) == (
+            randomized.success_rate,
+            randomized.speed_ratio,
+        )
+    table = stage_table(TRAINING_CURRICULUM)
+    for column in (
+        "slope_max", "push_max", "wheel_kick_max", "com_offset_max", "mass_fraction",
+        "friction_fraction", "max_latency_steps", "imu_angle_noise", "imu_rate_noise",
+        "encoder_noise",
+    ):
+        assert np.all(table[column] == 0), column
+    assert np.allclose(table["battery_voltage"], 11.1)
