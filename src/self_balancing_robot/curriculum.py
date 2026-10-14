@@ -134,9 +134,9 @@ BALANCE = Stage(name="balance", success_rate=0.95)
 # Sensor noise grows alongside in quarters and latency by one step at 0.2 and 0.4 m/s: switched
 # on together with everything else at the first randomization stage (run 20261010-165211),
 # survival there fell from ~100% to 35% and the mean |pitch| rose from ~1 to 6.5 deg.
-IMU_ANGLE_NOISE = 0.01
-IMU_RATE_NOISE = 0.05
-ENCODER_NOISE = 0.3
+IMU_ANGLE_NOISE = 0.04
+IMU_RATE_NOISE = 0.20
+ENCODER_NOISE = 0.5
 COMMANDS_1 = replace(
     BALANCE,
     name="commands 0.1 m/s",
@@ -156,7 +156,7 @@ COMMANDS_2 = replace(
     COMMANDS_1,
     name="commands 0.2 m/s",
     command_max=(0.2, 1.25),
-    max_latency_steps=1,
+    max_latency_steps=2,
     imu_angle_noise=IMU_ANGLE_NOISE * 2 / 4,
     imu_rate_noise=IMU_RATE_NOISE * 2 / 4,
     encoder_noise=ENCODER_NOISE * 2 / 4,
@@ -173,7 +173,7 @@ COMMANDS_4 = replace(
     COMMANDS_3,
     name="commands 0.4 m/s",
     command_max=FULL_COMMAND,
-    max_latency_steps=2,
+    max_latency_steps=5,
     imu_angle_noise=IMU_ANGLE_NOISE,
     imu_rate_noise=IMU_RATE_NOISE,
     encoder_noise=ENCODER_NOISE,
@@ -200,7 +200,7 @@ COMMANDS_4 = replace(
 #   0.07-0.10 m/s.
 PUSH_MAX = 0.5
 COM_OFFSET_MAX = 0.008
-WHEEL_KICK_MAX = 0.02
+WHEEL_KICK_MAX = 0.04
 RANDOMIZATION_1 = replace(
     COMMANDS_4,
     name="randomization 1/6",
@@ -208,8 +208,8 @@ RANDOMIZATION_1 = replace(
     push_max=PUSH_MAX / 6,
     com_offset_max=COM_OFFSET_MAX / 6,
     wheel_kick_max=WHEEL_KICK_MAX / 6,
-    mass_fraction=0.10,
-    friction_fraction=0.40,
+    mass_fraction=0.20,
+    friction_fraction=0.50,
     battery_voltage=(10.5, 12.5),
     min_episodes=5_000,
     success_rate=0.90,

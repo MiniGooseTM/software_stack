@@ -71,7 +71,7 @@ class PolicyConfig:
 class TrainingConfig:
     # Brax PPO on GPU. One PPO iteration collects num_envs * unroll_length steps and splits
     # them into num_minibatches minibatches (num_envs must be a multiple of num_minibatches).
-    total_timesteps: int = 250_000_000
+    total_timesteps: int = 500_000_000
     num_envs: int = 4096
     unroll_length: int = 32
     num_minibatches: int = 16
