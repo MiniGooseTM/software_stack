@@ -7,14 +7,16 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class RewardConfig:
+    """The reward of every curriculum stage, unless a stage sets its own (`Stage.rewards`)."""
+
     alive_weight: float = 2.0
     pitch_rate_weight: float = 0.1
     # Above the yaw weight so speed tracking still pays on slopes (v5 at 1.5 drove at ~60%
     # of the commanded speed).
     linear_velocity_weight: float = 2.0
     angular_velocity_weight: float = 1.0
-    action_weight: float = 0.01
-    smoothness_weight: float = 0.5
+    action_weight: float = 0.05
+    smoothness_weight: float = 1.0
     # Speed tracking blends a narrow kernel (precision near the command) with a wide one
     # (a gradient even far from it). With only the narrow kernel, v2 learned to crawl at
     # 0.05 m/s for 0.5 m/s commands because speeding up earned no reward until close.
@@ -49,7 +51,7 @@ class EnvironmentConfig:
     # it, PPO on the GPU sometimes learned to balance while spinning in place at ~8 rad/s
     # (early on, spinning kept a barely trained robot up for longer), and the narrow yaw-rate
     # kernel gives no gradient back from that far away.
-    yaw_rate_limit_rad_s: float = 3.0
+    yaw_rate_limit_rad_s: float = 6.0
     camera_distance_m: float = 0.8
     camera_elevation_degrees: float = -20.0
     camera_azimuth_degrees: float = 45.0
@@ -60,7 +62,7 @@ class PolicyConfig:
     # v1-v7 used (64, 32): 7.8k weights. (128, 64, 32) has 21.8k (87 KB as float32, ~22k
     # multiply-adds per step), still far below the ESP32's flash and the 10 ms control step.
     actor_layers: tuple[int, ...] = (128, 64, 32)
-    critic_layers: tuple[int, ...] = (128, 64)
+    critic_layers: tuple[int, ...] = (128, 64, 32)
     # Initial action noise std (exp(-0.5), SB3's log_std_init of the earlier runs).
     init_noise_std: float = 0.6065
 
@@ -69,7 +71,7 @@ class PolicyConfig:
 class TrainingConfig:
     # Brax PPO on GPU. One PPO iteration collects num_envs * unroll_length steps and splits
     # them into num_minibatches minibatches (num_envs must be a multiple of num_minibatches).
-    total_timesteps: int = 200_000_000
+    total_timesteps: int = 250_000_000
     num_envs: int = 4096
     unroll_length: int = 32
     num_minibatches: int = 16
