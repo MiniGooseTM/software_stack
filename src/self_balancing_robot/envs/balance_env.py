@@ -7,6 +7,7 @@ privileged simulation state used only by the training critic.
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from pathlib import Path
 from typing import ClassVar
@@ -161,6 +162,12 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
 
         self._stage = CurriculumStage(curriculum_stage)
         self._bind_model()
+        # `dt` and the buffer length are constant; the properties are called every step.
+        self._dt = self.dt
+        self._sensor_buffer_limit = 1 + max(
+            self.randomization_config.max_imu_latency_steps,
+            self.randomization_config.max_encoder_latency_steps,
+        )
         self._init_episode_state()
 
     def _bind_model(self) -> None:
@@ -237,6 +244,13 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
             ),
         }
         return model, data
+
+    def do_simulation(self, ctrl: np.ndarray, n_frames: int) -> None:
+        """Apply ctrl and advance n_frames, without the base class's per-call shape copy."""
+        self.data.ctrl[:] = ctrl
+        mujoco.mj_step(self.model, self.data, nstep=n_frames)
+        # Force quantities (cacc, cfrc) are not computed unless the model has a force sensor.
+        mujoco.mj_rnePostConstraint(self.model, self.data)
 
     # -------------------------------------------------------------- curriculum
 
@@ -435,57 +449,67 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
 
     # ----------------------------------------------------------- observations
 
-    def _rotation(self) -> np.ndarray:
-        """Body-to-world rotation matrix."""
-        return self.data.xmat[self._base_body_id].reshape(3, 3)
+    def _forward_direction(self) -> tuple[float, float]:
+        """Unit forward vector (x, y) of the robot projected on the world plane."""
+        xmat = self.data.xmat[self._base_body_id]
+        fx, fy = float(xmat[1]), float(xmat[4])
+        norm = max(math.hypot(fx, fy), 1e-9)
+        return fx / norm, fy / norm
 
     def _heading_axes(self) -> tuple[np.ndarray, np.ndarray]:
         """Unit forward and lateral vectors of the robot projected on the world xy-plane."""
-        forward = self._rotation()[:2, 1].copy()
-        forward /= max(np.linalg.norm(forward), 1e-9)
-        lateral = np.array([forward[1], -forward[0]])
-        return forward, lateral
+        fx, fy = self._forward_direction()
+        return np.array([fx, fy]), np.array([fy, -fx])
 
     def _tilt(self) -> tuple[float, float]:
         # Gravity direction in the body frame, as an accelerometer at rest would see it.
         # Body axes: x = wheel axle (pitch), y = forward (roll), z = up.
-        up = self._rotation()[2]
-        pitch = np.arctan2(up[1], up[2])
-        roll = np.arctan2(-up[0], np.hypot(up[1], up[2]))
-        return float(roll), float(pitch)
+        xmat = self.data.xmat[self._base_body_id]
+        ux, uy, uz = float(xmat[6]), float(xmat[7]), float(xmat[8])
+        return math.atan2(-ux, math.hypot(uy, uz)), math.atan2(uy, uz)
 
     def _imu_measurement(self) -> np.ndarray:
         """[roll, pitch, roll_rate, pitch_rate, yaw_rate] in the body frame."""
         roll, pitch = self._tilt()
-        pitch_rate, roll_rate, yaw_rate = self.data.qvel[self._base_qvel + 3 : self._base_qvel + 6]
+        qvel, dof = self.data.qvel, self._base_qvel
+        pitch_rate, roll_rate, yaw_rate = (
+            float(qvel[dof + 3]),
+            float(qvel[dof + 4]),
+            float(qvel[dof + 5]),
+        )
         return np.array([roll, pitch, roll_rate, pitch_rate, yaw_rate])
 
     def _encoder_measurement(self) -> np.ndarray:
         """Wheel velocities divided by the motor no-load speed."""
         return self.data.qvel[self._wheel_qvel] / self._max_wheel_speed
 
-    def _body_velocities(self) -> tuple[float, float, float]:
-        """True forward speed, lateral speed and world yaw rate."""
-        forward, lateral = self._heading_axes()
-        linear = self.data.qvel[self._base_qvel : self._base_qvel + 2]
-        angular_body = self.data.qvel[self._base_qvel + 3 : self._base_qvel + 6]
-        yaw_rate = float((self._rotation() @ angular_body)[2])
-        return float(linear @ forward), float(linear @ lateral), yaw_rate
+    def _body_velocities(
+        self, forward: tuple[float, float] | None = None
+    ) -> tuple[float, float, float]:
+        """True forward speed, lateral speed and world yaw rate.
 
-    def _clean_frame(self) -> np.ndarray:
+        ``forward`` is the unit forward vector from `_forward_direction`; pass it when the
+        caller already has it.
+        """
+        fx, fy = forward if forward is not None else self._forward_direction()
+        qvel, dof = self.data.qvel, self._base_qvel
+        vx, vy = float(qvel[dof]), float(qvel[dof + 1])
+        wx, wy, wz = float(qvel[dof + 3]), float(qvel[dof + 4]), float(qvel[dof + 5])
+        xmat = self.data.xmat[self._base_body_id]
+        yaw_rate = float(xmat[6]) * wx + float(xmat[7]) * wy + float(xmat[8]) * wz
+        return vx * fx + vy * fy, vx * fy - vy * fx, yaw_rate
+
+    def _clean_frame(self, fresh: np.ndarray | None = None) -> np.ndarray:
         """Frame with perfect, undelayed sensors (for the critic)."""
+        if fresh is None:
+            fresh = np.concatenate((self._imu_measurement(), self._encoder_measurement()))
         return np.concatenate(
-            (
-                self._scaled_command(),
-                self._imu_measurement(),
-                self._encoder_measurement(),
-                self._previous_action,
-            )
+            (self._scaled_command(), fresh[:5], fresh[5:], self._previous_action)
         )
 
-    def _actor_frame(self) -> np.ndarray:
-        """Delayed, noisy measurements as the onboard sensors would report them."""
-        imu, encoders = self._delayed_sensors()
+    def _actor_frame(self) -> tuple[np.ndarray, np.ndarray]:
+        """Delayed, noisy frame and the fresh sensor sample it was built from."""
+        imu, encoders, fresh = self._delayed_sensors()
         if self._stage >= CurriculumStage.DOMAIN_RANDOMIZATION:
             cfg = self.randomization_config
             imu[:2] += self.np_random.normal(0.0, cfg.imu_angle_noise_rad, size=2)
@@ -493,57 +517,70 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
             encoders += self.np_random.normal(
                 0.0, cfg.encoder_velocity_noise_rad_s / self._max_wheel_speed, size=2
             )
-        return np.concatenate((self._scaled_command(), imu, encoders, self._previous_action))
+        frame = np.concatenate((self._scaled_command(), imu, encoders, self._previous_action))
+        return frame, fresh
 
-    def _delayed_sensors(self) -> tuple[np.ndarray, np.ndarray]:
-        """The IMU and encoder samples from their respective latencies ago."""
-        self._sensor_buffer.appendleft(
-            np.concatenate((self._imu_measurement(), self._encoder_measurement()))
-        )
-        while len(self._sensor_buffer) > self._max_sensor_latency() + 1:
+    def _delayed_sensors(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """IMU and encoder samples from their respective latencies, plus the fresh sample."""
+        fresh = np.concatenate((self._imu_measurement(), self._encoder_measurement()))
+        self._sensor_buffer.appendleft(fresh)
+        while len(self._sensor_buffer) > self._sensor_buffer_limit:
             self._sensor_buffer.pop()
         oldest = len(self._sensor_buffer) - 1
         imu = self._sensor_buffer[min(self._imu_latency, oldest)][:5].copy()
         encoders = self._sensor_buffer[min(self._encoder_latency, oldest)][5:].copy()
-        return imu, encoders
+        return imu, encoders, fresh
 
     def _scaled_command(self) -> np.ndarray:
         return self._command / np.asarray(self.curriculum_config.command_limits)
 
-    def _max_sensor_latency(self) -> int:
-        cfg = self.randomization_config
-        return max(cfg.max_imu_latency_steps, cfg.max_encoder_latency_steps)
+    def _privileged_state(
+        self,
+        fresh: np.ndarray | None = None,
+        measurements: tuple[float, float, float, float] | None = None,
+    ) -> np.ndarray:
+        """Noise-free frame plus the physical truths the actor must infer.
 
-    def _privileged_state(self) -> np.ndarray:
-        """Noise-free frame plus the physical truths the actor must infer."""
+        ``measurements`` is (forward x, forward y, forward speed, lateral speed) when the
+        caller already computed them this step.
+        """
         cfg = self.randomization_config
-        forward, lateral = self._heading_axes()
-        forward_velocity, lateral_velocity, _ = self._body_velocities()
+        if measurements is None:
+            fx, fy = self._forward_direction()
+            forward_velocity, lateral_velocity, _ = self._body_velocities((fx, fy))
+        else:
+            fx, fy, forward_velocity, lateral_velocity = measurements
+        push_forward = self._push_force[0] * fx + self._push_force[1] * fy
+        push_lateral = self._push_force[0] * fy - self._push_force[1] * fx
+        normal_x, normal_y = float(self._ground_normal[0]), float(self._ground_normal[1])
         physics = (
             _normalized(self._mass_scale - 1.0, cfg.mass_fraction),
             _normalized(self._friction_scale - 1.0, cfg.friction_fraction),
-            _normalized(self._push_force @ forward, cfg.impulse_force_n),
-            _normalized(self._push_force @ lateral, cfg.impulse_force_n),
+            _normalized(push_forward, cfg.impulse_force_n),
+            _normalized(push_lateral, cfg.impulse_force_n),
             _normalized(self._motor_latency, cfg.max_motor_latency_steps),
             _normalized(self._imu_latency, cfg.max_imu_latency_steps),
             _normalized(self._encoder_latency, cfg.max_encoder_latency_steps),
-            _normalized(self._ground_normal[:2] @ forward, np.sin(cfg.slope_radians)),
-            _normalized(self._ground_normal[:2] @ lateral, np.sin(cfg.slope_radians)),
+            _normalized(normal_x * fx + normal_y * fy, np.sin(cfg.slope_radians)),
+            _normalized(normal_x * fy - normal_y * fx, np.sin(cfg.slope_radians)),
         )
         return np.concatenate(
             (
-                self._clean_frame(),
+                self._clean_frame(fresh),
                 [forward_velocity, lateral_velocity],
                 _normalized(self._com_offset, self._max_com_offset),
                 physics,
             )
         )
 
-    def _get_obs(self) -> np.ndarray:
-        self._history.appendleft(self._actor_frame())
+    def _get_obs(
+        self, measurements: tuple[float, float, float, float] | None = None
+    ) -> np.ndarray:
+        frame, fresh = self._actor_frame()
+        self._history.appendleft(frame)
         while len(self._history) < self.history_length:
             self._history.append(self._history[-1])
-        return np.concatenate((*self._history, self._privileged_state()))
+        return np.concatenate((*self._history, self._privileged_state(fresh, measurements)))
 
     # -------------------------------------------------------- randomization
 
@@ -688,7 +725,7 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         if self._stage < CurriculumStage.DOMAIN_RANDOMIZATION:
             return
         cfg = self.randomization_config
-        time = self._episode_step * self.dt
+        time = self._episode_step * self._dt
         if time >= self._next_impulse_time:
             direction = self.np_random.uniform(-np.pi, np.pi)
             magnitude = self._sample_level_magnitude(self.push_limit)
@@ -700,9 +737,13 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         self.data.xfrc_applied[self._base_body_id, :2] = self._push_force
 
     def _base_collision(self) -> bool:
-        for contact in self.data.contact[: self.data.ncon]:
-            geom_pair = {int(contact.geom1), int(contact.geom2)}
-            if geom_pair == {self._ground_geom_id, self._base_geom_id}:
+        ground, base = self._ground_geom_id, self._base_geom_id
+        contacts = self.data.contact
+        for i in range(self.data.ncon):
+            contact = contacts[i]
+            if (contact.geom1 == ground and contact.geom2 == base) or (
+                contact.geom1 == base and contact.geom2 == ground
+            ):
                 return True
         return False
 
@@ -716,7 +757,7 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
             elif self._counts_towards_speed_ratio(linear):
                 # Speed along the commanded direction (driving backwards counts against).
                 self._episode_tracking[:2] += (forward_velocity * np.sign(linear), abs(linear))
-        self._command_age += self.dt
+        self._command_age += self._dt
 
     def _counts_towards_speed_ratio(self, linear: float) -> bool:
         """Small commands are ignored: their speed signal is lost in balancing wobble."""
@@ -734,7 +775,8 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
 
         roll, pitch = self._tilt()
         pitch_rate = float(self.data.qvel[self._base_qvel + 3])
-        forward_velocity, _, yaw_rate = self._body_velocities()
+        forward = self._forward_direction()
+        forward_velocity, lateral_velocity, yaw_rate = self._body_velocities(forward)
         self._track_command(forward_velocity)
 
         # Rewards use the command the policy was conditioned on and its own action
@@ -764,10 +806,11 @@ class SelfBalancingRobotEnv(MujocoEnv, gym.utils.EzPickle):
         if terminated or truncated:
             self._advance_curriculum(not terminated)
 
-        self._command_time_remaining -= self.dt
+        self._command_time_remaining -= self._dt
         if self._command_time_remaining <= 0 and not self._command_held:
             self._sample_command(allow_reversal=True)
-        return self._get_obs(), float(reward), terminated, truncated, info
+        measurements = (*forward, forward_velocity, lateral_velocity)
+        return self._get_obs(measurements), float(reward), terminated, truncated, info
 
     def _delayed_action(self, action: np.ndarray) -> np.ndarray:
         """The action applied this step; motor latency delays it by a few steps."""
