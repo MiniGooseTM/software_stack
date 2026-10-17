@@ -90,28 +90,8 @@ class TrainingMetricsCallback(BaseCallback):
         self.eval_env.close()
 
     def _evaluate(self) -> dict:
-        stages = self.training_env.get_attr("curriculum_stage")
-        progress = self.training_env.get_attr("curriculum_progress")
-        self.history["steps"].append(self.num_timesteps)
-        self.history["stage_min"].append(min(progress))
-        self.history["stage_mean"].append(float(np.mean(progress)))
-        self.logger.record("curriculum/min_stage", min(stages))
-        self.logger.record("curriculum/mean_stage", float(np.mean(stages)))
-        # Stage + fraction of its levels passed (2.5 = halfway through the command ramp).
-        self.logger.record("curriculum/min_progress", min(progress))
-        self.logger.record("curriculum/mean_progress", float(np.mean(progress)))
-
-        # Training rollouts since the last evaluation (reward/survival from the Monitor buffer).
-        episodes = list(self.model.ep_info_buffer)
-        train = {key: value / max(self._train_count, 1) for key, value in self._train_sums.items()}
-        train["reward"] = np.mean([e["r"] for e in episodes]) if episodes else np.nan
-        train["survival"] = (
-            np.mean([e["l"] >= self.eval_env.max_episode_steps for e in episodes])
-            if episodes
-            else np.nan
-        )
-        self._train_sums.clear()
-        self._train_count = 0
+        self._record_curriculum()
+        train = self._collect_train_metrics()
 
         # Held-out episodes at the hardest stage and level every training env has reached.
         # Setting it each time also clears the eval env's own curriculum window.
@@ -136,6 +116,34 @@ class TrainingMetricsCallback(BaseCallback):
             f"After {self.num_timesteps:,} steps,",
         )
         return traces[0]
+
+    def _record_curriculum(self) -> None:
+        stages = self.training_env.get_attr("curriculum_stage")
+        progress = self.training_env.get_attr("curriculum_progress")
+        self.history["steps"].append(self.num_timesteps)
+        self.history["stage_min"].append(min(progress))
+        self.history["stage_mean"].append(float(np.mean(progress)))
+        self.logger.record("curriculum/min_stage", min(stages))
+        self.logger.record("curriculum/mean_stage", float(np.mean(stages)))
+        # Stage + fraction of its levels passed (2.5 = halfway through the command ramp).
+        self.logger.record("curriculum/min_progress", min(progress))
+        self.logger.record("curriculum/mean_progress", float(np.mean(progress)))
+
+    def _collect_train_metrics(self) -> dict[str, float]:
+        """Training rollouts since the last evaluation (reward/survival from the Monitor buffer)."""
+        episodes = list(self.model.ep_info_buffer)
+        metrics = {
+            key: value / max(self._train_count, 1) for key, value in self._train_sums.items()
+        }
+        metrics["reward"] = np.mean([e["r"] for e in episodes]) if episodes else np.nan
+        metrics["survival"] = (
+            np.mean([e["l"] >= self.eval_env.max_episode_steps for e in episodes])
+            if episodes
+            else np.nan
+        )
+        self._train_sums.clear()
+        self._train_count = 0
+        return metrics
 
     def _save_plot(self) -> None:
         plot_training_metrics(self.history, self.plot_dir / "training_metrics.png")
@@ -179,14 +187,14 @@ class EvaluationVideoCallback(BaseCallback):
         stage, level = _least_advanced(self.training_env)
         self.video_env.set_curriculum_stage(stage)
         self.video_env.set_difficulty_level(level)
-        observation, _ = self.video_env.reset(seed=self.seed)
-        frames = [self.video_env.render()]
-        for _ in range(self.max_steps):
-            action, _ = self.model.predict(observation, deterministic=True)
-            observation, _, terminated, truncated, _ = self.video_env.step(action)
-            frames.append(self.video_env.render())
-            if terminated or truncated:
-                break
+        frames: list = []
+        run_episode(
+            self.video_env,
+            self.model,
+            seed=self.seed,
+            max_steps=self.max_steps,
+            frames=frames,
+        )
         self.video_dir.mkdir(parents=True, exist_ok=True)
         path = self.video_dir / f"{name}_stage{stage}_level{level}.mp4"
         imageio.mimsave(path, frames, fps=self.video_env.metadata["render_fps"])

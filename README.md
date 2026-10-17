@@ -83,6 +83,8 @@ On an Ubuntu host with an NVIDIA runtime, use `Dockerfile.gpu` and add `--gpus a
 - `src/self_balancing_robot/evaluate.py`: visual evaluation entry point.
 - `src/self_balancing_robot/teleop.py`: keyboard driving of a trained policy in a live window.
 - `src/self_balancing_robot/export.py`: actor weights to a C header and a policy file for the ESP32.
+- `scripts/model_test.py`: load a MuJoCo model and print its size.
+- `scripts/balance_pid.py`: PID balancing demo (with a complementary pitch filter).
 - `tests/`: environment smoke tests.
 
 The XML is intentionally a starting point. The environment implements four curriculum stages: upright stabilization, micro-mobility, full command tracking, and domain randomization/disturbance recovery. Before transferring a policy to hardware, replace dimensions, masses, friction, actuator limits, sensor observations, latency, and safety thresholds with measured robot values. Collect synchronized IMU, encoder, command, motor, battery, and fall-event logs to calibrate the model and define validation targets.

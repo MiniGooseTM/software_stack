@@ -18,16 +18,28 @@ METRIC_KEYS = ("reward", "survival", "linear_error", "angular_error", "abs_pitch
 
 
 def run_episode(
-    env: SelfBalancingRobotEnv, model, seed: int | None = None, max_steps: int | None = None
+    env: SelfBalancingRobotEnv,
+    model,
+    seed: int | None = None,
+    max_steps: int | None = None,
+    frames: list | None = None,
 ) -> dict:
-    """Run one deterministic episode and return its time series."""
+    """Run one deterministic episode and return its time series.
+
+    If ``frames`` is given, the rendered frames (one before the first step, then after
+    every step) are appended to it.
+    """
     observation, _ = env.reset(seed=seed)
+    if frames is not None:
+        frames.append(env.render())
     trace: dict[str, list] = {key: [] for key in (*TRACE_KEYS, "action", "reward")}
     info: dict = {}
     for _ in range(max_steps or env.max_episode_steps):
         action, _ = model.predict(observation, deterministic=True)
         observation, reward, terminated, truncated, info = env.step(action)
-        if env.render_mode == "human":
+        if frames is not None:
+            frames.append(env.render())
+        elif env.render_mode == "human":
             env.render()
         for key in TRACE_KEYS:
             trace[key].append(info[key])

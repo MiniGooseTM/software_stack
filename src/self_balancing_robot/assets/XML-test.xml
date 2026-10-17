@@ -20,8 +20,8 @@
 
     <!-- Scale all meshes to meters -->
     <asset>
-        <mesh name="left_wheel_1" file="meshes/left_wheel_1.stl" scale="0.001 0.001 0.001" />
-        <mesh name="right_wheel_1" file="meshes/right_wheel_1.stl" scale="0.001 0.001 0.001" />
+        <mesh name="left_wheel_1" file="meshes/left_wheel.stl" scale="0.001 0.001 0.001" />
+        <mesh name="right_wheel_1" file="meshes/right_wheel.stl" scale="0.001 0.001 0.001" />
         <mesh name="base_link" file="meshes/base_link.stl" scale="0.001 0.001 0.001" />
 
                 <!-- Use simple gradient for sky texture -->

@@ -8,6 +8,7 @@ exactly like on the real robot.
 import argparse
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import glfw
 import mujoco
@@ -24,25 +25,40 @@ from self_balancing_robot.policy import load_model
 ARROW_KEYS = (glfw.KEY_UP, glfw.KEY_DOWN, glfw.KEY_LEFT, glfw.KEY_RIGHT)
 # The viewer toggles geom groups on 0-4; on many layouts "=" or "+" is Shift + a digit.
 DIGIT_KEYS = tuple(range(glfw.KEY_0, glfw.KEY_9 + 1))
-# Camera views cycled with V: (name, azimuth relative to the robot heading or None for
-# mouse control, elevation in degrees, distance in m). All of them follow the robot.
+
+
+class CameraView(NamedTuple):
+    name: str
+    azimuth: float | None  # relative to the robot heading; None = free mouse view
+    elevation: float
+    distance: float
+
+
+# Camera views cycled with V. All of them follow the robot.
 CAMERA_VIEWS = (
-    ("chase", 0.0, -25.0, 1.0),
-    ("top-down", 0.0, -89.0, 1.5),
-    ("side", 90.0, -5.0, 0.8),
-    ("free (mouse)", None, -25.0, 1.0),
+    CameraView("chase", 0.0, -25.0, 1.0),
+    CameraView("top-down", 0.0, -89.0, 1.5),
+    CameraView("side", 90.0, -5.0, 0.8),
+    CameraView("free (mouse)", None, -25.0, 1.0),
 )
-# Physics parameters that can be typed in: key -> (label, unit shown, training range).
+
+
+class PhysicsField(NamedTuple):
+    label: str
+    unit: str
+    training_range: str
+    com_axis: int | None = None  # index into the CoM offset for X / Y / Z
+
+
+# Physics parameters that can be typed in: key -> field.
 PHYSICS_KEYS = {
-    glfw.KEY_G: (
-        "slope",
-        "rad",
-        f"training range +-{DEFAULT_RANDOMIZATION_CONFIG.slope_radians:g}",
+    glfw.KEY_G: PhysicsField(
+        "slope", "rad", f"training range +-{DEFAULT_RANDOMIZATION_CONFIG.slope_radians:g}"
     ),
-    glfw.KEY_F: ("friction", "coefficient", "training range 0.48 to 1.12"),
-    glfw.KEY_X: ("CoM x (axle)", "mm", "training range +-4.9"),
-    glfw.KEY_Y: ("CoM y (forward)", "mm", "training range +-4.9"),
-    glfw.KEY_Z: ("CoM z (up)", "mm", "training range +-4.9"),
+    glfw.KEY_F: PhysicsField("friction", "coefficient", "training range 0.48 to 1.12"),
+    glfw.KEY_X: PhysicsField("CoM x (axle)", "mm", "training range +-4.9", com_axis=0),
+    glfw.KEY_Y: PhysicsField("CoM y (forward)", "mm", "training range +-4.9", com_axis=1),
+    glfw.KEY_Z: PhysicsField("CoM z (up)", "mm", "training range +-4.9", com_axis=2),
 }
 HELP = (
     "Arrows: drive (hold)\n"
@@ -100,7 +116,7 @@ class KeyboardTeleop:
             if key == glfw.KEY_N:
                 self.env.set_physics(
                     slope=0.0,
-                    friction=self.env._nominal_ground_friction,
+                    friction=self.env.nominal_friction,
                     com_offset=np.zeros(3),
                 )
                 self.reset_requested = True
@@ -115,8 +131,8 @@ class KeyboardTeleop:
             self.editing = None
 
     def _apply_edit(self) -> None:
-        label, unit, _ = PHYSICS_KEYS[self.editing]
         key, self.editing = self.editing, None
+        field = PHYSICS_KEYS[key]
         try:
             value = float(self.edit_text)
         except ValueError:
@@ -132,9 +148,9 @@ class KeyboardTeleop:
             self.env.set_physics(friction=value)
         else:
             com_offset = self.env.physics["com_offset"]
-            com_offset[(glfw.KEY_X, glfw.KEY_Y, glfw.KEY_Z).index(key)] = value / 1000.0
+            com_offset[field.com_axis] = value / 1000.0
             self.env.set_physics(com_offset=com_offset)
-        self.message = f"{label} = {value:g} {unit}"
+        self.message = f"{field.label} = {value:g} {field.unit}"
 
     def _char_callback(self, window, codepoint: int) -> None:
         # Characters, not key codes, so "+" and "-" work on any keyboard layout and keypad.
@@ -149,12 +165,12 @@ class KeyboardTeleop:
             self.speed_fraction = max(self.speed_fraction - 0.25, 0.25)
 
     def _apply_camera_view(self) -> None:
-        _, _, elevation, distance = CAMERA_VIEWS[self.camera_view]
+        view = CAMERA_VIEWS[self.camera_view]
         camera = self.viewer.cam
         camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-        camera.trackbodyid = self.env.model.body("base_link").id
-        camera.elevation = elevation
-        camera.distance = distance
+        camera.trackbodyid = self.env.base_body_id
+        camera.elevation = view.elevation
+        camera.distance = view.distance
 
     def _pressed(self, key: int) -> bool:
         return glfw.get_key(self.viewer.window, key) == glfw.PRESS
@@ -172,23 +188,30 @@ class KeyboardTeleop:
         return not (self.quit_requested or glfw.window_should_close(self.viewer.window))
 
     def render(self, info: dict) -> None:
-        view_name, relative_azimuth, elevation, _ = CAMERA_VIEWS[self.camera_view]
-        if relative_azimuth is not None:
+        view = CAMERA_VIEWS[self.camera_view]
+        if view.azimuth is not None:
             # Turn with the robot; the mouse can still zoom (scroll).
-            heading = np.degrees(np.arctan2(*self.env._heading_axes()[0][::-1]))
-            self.viewer.cam.azimuth = heading + relative_azimuth
-            self.viewer.cam.elevation = elevation
+            self.viewer.cam.azimuth = self.env.heading_degrees + view.azimuth
+            self.viewer.cam.elevation = view.elevation
         self.viewer.add_overlay(mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT, HELP, "")
-        physics = self.env.physics
-        com_mm = physics["com_offset"] * 1000.0
+        self._draw_edit_prompt()
+        self._draw_physics()
+        self._draw_status(info, view.name)
+        self.env.render()
+
+    def _draw_edit_prompt(self) -> None:
         if self.editing is not None:
-            label, unit, training_range = PHYSICS_KEYS[self.editing]
-            prompt = f"{label} [{unit}], {training_range}"
+            field = PHYSICS_KEYS[self.editing]
+            prompt = f"{field.label} [{field.unit}], {field.training_range}"
             self.viewer.add_overlay(
                 mujoco.mjtGridPos.mjGRID_TOP, prompt, f"{self.edit_text}_  (Enter / Esc)"
             )
         elif self.message:
             self.viewer.add_overlay(mujoco.mjtGridPos.mjGRID_TOP, self.message, "")
+
+    def _draw_physics(self) -> None:
+        physics = self.env.physics
+        com_mm = physics["com_offset"] * 1000.0
         self.viewer.add_overlay(
             mujoco.mjtGridPos.mjGRID_BOTTOMLEFT,
             "slope\nfriction\nCoM offset x/y/z",
@@ -196,6 +219,8 @@ class KeyboardTeleop:
             f"{physics['friction']:.2f}\n"
             f"{com_mm[0]:.1f} / {com_mm[1]:.1f} / {com_mm[2]:.1f} mm",
         )
+
+    def _draw_status(self, info: dict, view_name: str) -> None:
         self.viewer.add_overlay(
             mujoco.mjtGridPos.mjGRID_TOPRIGHT,
             "v cmd / actual\nyaw cmd / actual\npitch\nspeed limit\nstage\ncamera",
@@ -206,7 +231,6 @@ class KeyboardTeleop:
             f"{info['curriculum_stage']}\n"
             f"{view_name}",
         )
-        self.env.render()
 
 
 def main() -> None:

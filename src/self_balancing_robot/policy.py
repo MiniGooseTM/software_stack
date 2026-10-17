@@ -19,6 +19,7 @@ from self_balancing_robot.config import DEFAULT_POLICY_CONFIG
 
 
 def _relu_mlp(input_size: int, layer_sizes: Sequence[int]) -> nn.Sequential:
+    """Linear layers of the given widths with a ReLU after each one."""
     layers: list[nn.Module] = []
     for size in layer_sizes:
         layers += [nn.Linear(input_size, size), nn.ReLU()]
@@ -27,6 +28,8 @@ def _relu_mlp(input_size: int, layer_sizes: Sequence[int]) -> nn.Sequential:
 
 
 class AsymmetricMlpExtractor(nn.Module):
+    """Actor and critic networks that read different halves of the observation."""
+
     def __init__(
         self,
         actor_observation_size: int,

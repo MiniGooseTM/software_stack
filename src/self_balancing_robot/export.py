@@ -42,6 +42,27 @@ DEFAULT_POLICY_FILE = Path("models/policy.bin")
 
 POLICY_FILE_MAGIC = b"GPOL"
 POLICY_FILE_VERSION = 1
+# Field order of the policy-file header; the struct format below must match it one to one.
+_HEADER_FIELDS = (
+    "magic",
+    "version",
+    "header_size",
+    "total_size",
+    "num_layers",
+    "input_size",
+    "output_size",
+    "frame_size",
+    "history_length",
+    "num_tests",
+    "frame_fields_crc",
+    "control_period_s",
+    "max_linear_command",
+    "max_angular_command",
+    "half_track_m",
+    "wheel_no_load_speed",
+    "tilt_limit_rad",
+    "name",
+)
 _HEADER = struct.Struct("<4sHHIHHHHHHIffffff44s")
 _LAYER = struct.Struct("<HHHH")
 ACTIVATION_NONE = 0
@@ -78,7 +99,9 @@ def _array(name: str, values: np.ndarray) -> str:
     return f"static const float {name}{dims} = {{\n{rows}\n}};\n"
 
 
-def weights_header(model_path: Path, layers: list[torch.nn.Linear], env) -> str:
+def weights_header(
+    model_path: Path, layers: list[torch.nn.Linear], env: SelfBalancingRobotEnv
+) -> str:
     sizes = [layers[0].in_features, *(layer.out_features for layer in layers)]
     command_limits = env.curriculum_config.command_limits
     lines = [
@@ -102,8 +125,8 @@ def weights_header(model_path: Path, layers: list[torch.nn.Linear], env) -> str:
         f"#define POLICY_CONTROL_PERIOD_S {env.dt:.6f}f",
         f"#define POLICY_MAX_LINEAR_COMMAND {command_limits[0]:.6f}f   // m/s",
         f"#define POLICY_MAX_ANGULAR_COMMAND {command_limits[1]:.6f}f  // rad/s",
-        f"#define POLICY_HALF_TRACK_M {env._half_track:.6f}f",
-        f"#define POLICY_WHEEL_NO_LOAD_SPEED {env._max_wheel_speed:.6f}f  // rad/s",
+        f"#define POLICY_HALF_TRACK_M {env.half_track:.6f}f",
+        f"#define POLICY_WHEEL_NO_LOAD_SPEED {env.max_wheel_speed:.6f}f  // rad/s",
         f"#define POLICY_TILT_LIMIT_RAD {env.environment_config.upright_limit_radians:.6f}f",
         "",
     ]
@@ -135,7 +158,7 @@ def frame_fields_crc() -> int:
 def policy_file(
     model_path: Path,
     layers: list[torch.nn.Linear],
-    env,
+    env: SelfBalancingRobotEnv,
     test_inputs: np.ndarray,
     test_outputs: np.ndarray,
 ) -> bytes:
@@ -170,8 +193,8 @@ def policy_file(
         env.dt,
         command_limits[0],
         command_limits[1],
-        env._half_track,
-        env._max_wheel_speed,
+        env.half_track,
+        env.max_wheel_speed,
         env.environment_config.upright_limit_radians,
         name,
     )
@@ -181,29 +204,25 @@ def policy_file(
 
 def read_policy_file(data: bytes) -> dict:
     """Parse and check a policy file; the inverse of `policy_file`."""
-    fields = _HEADER.unpack_from(data)
-    (magic, version, header_size, total_size, num_layers, input_size, output_size) = fields[:7]
-    if magic != POLICY_FILE_MAGIC or version != POLICY_FILE_VERSION or header_size != _HEADER.size:
+    policy = dict(zip(_HEADER_FIELDS, _HEADER.unpack_from(data)))
+    if (
+        policy["magic"] != POLICY_FILE_MAGIC
+        or policy["version"] != POLICY_FILE_VERSION
+        or policy["header_size"] != _HEADER.size
+    ):
         raise ValueError("not a version 1 policy file")
+    total_size = policy["total_size"]
     if total_size != len(data):
         raise ValueError(f"file is {len(data)} bytes, header says {total_size}")
     (crc,) = struct.unpack_from("<I", data, total_size - 4)
     if zlib.crc32(data[: total_size - 4]) != crc:
         raise ValueError("CRC mismatch")
-    names = (
-        "frame_size",
-        "history_length",
-        "num_tests",
-        "frame_fields_crc",
-        "control_period_s",
-        "max_linear_command",
-        "max_angular_command",
-        "half_track_m",
-        "wheel_no_load_speed",
-        "tilt_limit_rad",
+    policy["name"] = policy["name"].rstrip(b"\0").decode()
+    num_layers, input_size, output_size = (
+        policy["num_layers"],
+        policy["input_size"],
+        policy["output_size"],
     )
-    policy = dict(zip(names, fields[7:17]))
-    policy["name"] = fields[17].rstrip(b"\0").decode()
     offset = _HEADER.size
     shapes = [_LAYER.unpack_from(data, offset + i * _LAYER.size) for i in range(num_layers)]
     offset += num_layers * _LAYER.size
@@ -227,7 +246,7 @@ def read_policy_file(data: bytes) -> dict:
 
 
 def _check_forward(
-    model, layers: list[torch.nn.Linear], env, seed: int
+    model, layers: list[torch.nn.Linear], env: SelfBalancingRobotEnv, seed: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """The manual forward pass must reproduce SB3's action on simulated inputs.
 
