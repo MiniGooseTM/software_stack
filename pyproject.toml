@@ -5,20 +5,26 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "self-balancing-robot"
 version = "0.1.0"
-description = "MuJoCo environment and PPO training setup for a self-balancing robot"
-requires-python = ">=3.10,<3.13"
+description = "MuJoCo MJX environment and GPU PPO training (Brax) for a self-balancing robot"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "gymnasium>=0.29,<1.1",
+    "brax>=0.14,<0.15",
+    "gymnasium>=1.0,<2",
     "imageio[ffmpeg]>=2.31,<3",
+    # brax 0.14 still calls jax.device_put_replicated, removed in jax 0.10.
+    "jax>=0.7,<0.10",
     "matplotlib>=3.7,<4",
-    "mujoco>=3.2,<3.3",
+    "mujoco>=3.3",
+    "mujoco-mjx>=3.3",
     "numpy>=1.24,<3",
-    "stable-baselines3>=2.3,<3",
+    "playground>=0.2,<0.3",
     "tensorboard>=2.14,<3",
-    "torch>=2.2,<3",
+    "tensorboardX>=2.6,<3",
 ]
 
 [project.optional-dependencies]
+# NVIDIA GPU training: pip install -e ".[cuda]"
+cuda = ["jax[cuda12]>=0.7,<0.10"]
 dev = [
     "pytest>=8,<9",
     "ruff>=0.6,<1",
@@ -32,7 +38,7 @@ self_balancing_robot = ["assets/*.xml", "assets/meshes/*.stl"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
