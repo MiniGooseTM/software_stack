@@ -153,6 +153,9 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv-*/
+# OSMesa extracted by scripts/setup_osmesa.sh
+.mujoco-osmesa/
 env/
 venv/
 ENV/
@@ -221,9 +224,9 @@ __marimo__/
 
 # Experiment outputs
 logs/
-# Models: only the current policy and the archived v7 (30M) and v10 weights are tracked.
+# Models: training runs (models/runs/) stay local; only the deployed policy and the archive
+# notes of earlier (SB3) runs are tracked.
 models/*
-!models/ppo_balance.zip
 !models/policy_weights.h
 !models/policy.bin
 !models/archive/
@@ -232,14 +235,13 @@ models/archive/*
 !models/archive/v10_reversals_30M/
 models/archive/v7_command_ramp_30M/*
 models/archive/v10_reversals_30M/*
-!models/archive/v7_command_ramp_30M/ppo_balance.zip
-!models/archive/v10_reversals_30M/ppo_balance.zip
 !models/archive/*/README.md
 !models/archive/*/config_snapshot.py
 !models/archive/*/REWARDS_snapshot.md
 # macOS
 .DS_Store
 
-# Evaluation videos and training plots
+# Evaluation videos and plots
 videos/
+plots/
 src/plots/

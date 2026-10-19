@@ -2,25 +2,30 @@
 
 Hold the arrow keys to command the robot: up/down for forward/backward speed and
 left/right for turning. The policy only receives the (v_cmd, omega_cmd) command,
-exactly like on the real robot.
+exactly like on the real robot. The simulation is the JAX training environment, stepped
+one control period at a time (GPU or CPU) and mirrored into a MuJoCo window.
 """
 
 import argparse
+import os
 import time
 from pathlib import Path
 from typing import NamedTuple
 
 import glfw
+import jax
+import jax.numpy as jnp
 import mujoco
 import numpy as np
+from gymnasium.envs.mujoco.mujoco_rendering import MujocoRenderer
 
-from self_balancing_robot.config import (
-    DEFAULT_CURRICULUM_CONFIG,
-    DEFAULT_RANDOMIZATION_CONFIG,
-    DEFAULT_TRAINING_CONFIG,
-)
-from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
-from self_balancing_robot.policy import load_model
+from self_balancing_robot.actor import Actor, resolve_model
+from self_balancing_robot.curriculum import CURRICULUM, FULL_COMMAND
+from self_balancing_robot.envs.balance_env import ACTOR_KEY, SelfBalancingRobotEnv
+
+# One environment: CPU JAX has less per-step overhead than a GPU (override with JAX_PLATFORMS).
+if "JAX_PLATFORMS" not in os.environ:
+    jax.config.update("jax_platforms", "cpu")
 
 ARROW_KEYS = (glfw.KEY_UP, glfw.KEY_DOWN, glfw.KEY_LEFT, glfw.KEY_RIGHT)
 # The viewer toggles geom groups on 0-4; on many layouts "=" or "+" is Shift + a digit.
@@ -41,24 +46,24 @@ CAMERA_VIEWS = (
     CameraView("side", 90.0, -5.0, 0.8),
     CameraView("free (mouse)", None, -25.0, 1.0),
 )
-
-
-class PhysicsField(NamedTuple):
-    label: str
-    unit: str
-    training_range: str
-    com_axis: int | None = None  # index into the CoM offset for X / Y / Z
-
-
-# Physics parameters that can be typed in: key -> field.
+# Training ranges shown when typing in physics values: those of the last stage.
+_LAST_STAGE = CURRICULUM[-1]
+_COM_RANGE_MM = _LAST_STAGE.com_offset_max * 1000
+# Physics parameters that can be typed in: key -> (label, unit shown, training range).
 PHYSICS_KEYS = {
-    glfw.KEY_G: PhysicsField(
-        "slope", "rad", f"training range +-{DEFAULT_RANDOMIZATION_CONFIG.slope_radians:g}"
+    glfw.KEY_G: (
+        "slope",
+        "rad",
+        f"training range +-{_LAST_STAGE.slope_max:g}",
     ),
-    glfw.KEY_F: PhysicsField("friction", "coefficient", "training range 0.48 to 1.12"),
-    glfw.KEY_X: PhysicsField("CoM x (axle)", "mm", "training range +-4.9", com_axis=0),
-    glfw.KEY_Y: PhysicsField("CoM y (forward)", "mm", "training range +-4.9", com_axis=1),
-    glfw.KEY_Z: PhysicsField("CoM z (up)", "mm", "training range +-4.9", com_axis=2),
+    glfw.KEY_F: (
+        "friction",
+        "coefficient",
+        f"training range nominal +-{_LAST_STAGE.friction_fraction:.0%}",
+    ),
+    glfw.KEY_X: ("CoM x (axle)", "mm", f"training range +-{_COM_RANGE_MM:g}"),
+    glfw.KEY_Y: ("CoM y (forward)", "mm", f"training range +-{_COM_RANGE_MM:g}"),
+    glfw.KEY_Z: ("CoM z (up)", "mm", f"training range +-{_COM_RANGE_MM:g}"),
 }
 HELP = (
     "Arrows: drive (hold)\n"
@@ -72,9 +77,141 @@ HELP = (
 )
 
 
-class KeyboardTeleop:
-    def __init__(self, env: SelfBalancingRobotEnv, max_linear: float, max_angular: float):
+class TeleopSim:
+    """One JAX environment driven step by step, with a held command and pinned physics."""
+
+    def __init__(self, env: SelfBalancingRobotEnv, seed: int = 0):
         self.env = env
+        self._reset = jax.jit(env.reset_episode)
+        self._drive = jax.jit(self._drive_step)
+        self.persistent = {**env.initial_persistent(), "command_held": jnp.array(True)}
+        self.command = np.zeros(2, dtype=np.float32)
+        self.key = jax.random.PRNGKey(seed)
+        self.data = mujoco.MjData(env.mj_model)
+        self.reset()
+
+    def _drive_step(self, state, command, action):
+        """Set the held command, take one control step, return the values the window shows."""
+        state = state.replace(info={**state.info, "command": command})
+        state = self.env.step(state, action)
+        info = state.info
+        readings = {
+            "observation": state.obs[ACTOR_KEY],
+            "v_cmd": info["command"][0],
+            "omega_cmd": info["command"][1],
+            "forward_velocity": info["forward_velocity"],
+            "yaw_rate": info["yaw_rate"],
+            "pitch": info["pitch"],
+            "curriculum_stage": info["stage"],
+            "terminated": info["terminated"],
+            "slope": info["slope"],
+            "friction_scale": info["friction_scale"],
+            "com_offset": info["com_offset"],
+            "forward": self.env.heading_axes(self.env._rotation(state.data.qpos))[0],
+            "qpos": state.data.qpos,
+            "qvel": state.data.qvel,
+            "mocap_quat": state.data.mocap_quat,
+            "xfrc_applied": state.data.xfrc_applied,
+        }
+        return state, readings
+
+    def reset(self) -> None:
+        self.key, key = jax.random.split(self.key)
+        self.persistent["command"] = jnp.asarray(self.command)
+        self.state = self._reset(key, self.persistent)
+        self.readings = self._drive_free_readings()
+
+    def _drive_free_readings(self) -> dict:
+        info, data = self.state.info, self.state.data
+        return jax.device_get(
+            {
+                "observation": self.state.obs[ACTOR_KEY],
+                "slope": info["slope"],
+                "friction_scale": info["friction_scale"],
+                "com_offset": info["com_offset"],
+                "forward": np.array([0.0, 1.0]),
+                "qpos": data.qpos,
+                "qvel": data.qvel,
+                "mocap_quat": data.mocap_quat,
+                "xfrc_applied": data.xfrc_applied,
+            }
+        )
+
+    def hold_command(self, linear_velocity: float, angular_velocity: float) -> None:
+        """Use this command, scaled down together so the outer wheel stays within full speed
+        (`SelfBalancingRobotEnv.wheel_feasible_command`), instead of random ones."""
+        full_speed = FULL_COMMAND[0]
+        outer_wheel = abs(linear_velocity) + abs(angular_velocity) * self.env.half_track
+        scale = min(1.0, full_speed / outer_wheel) if outer_wheel > 0 else 1.0
+        self.command = np.array(
+            [linear_velocity * scale, angular_velocity * scale], dtype=np.float32
+        )
+
+    def _set_info(self, **values) -> None:
+        info = dict(self.state.info)
+        for name, value in values.items():
+            info[name] = jnp.asarray(value, dtype=info[name].dtype)
+        self.state = self.state.replace(info=info)
+
+    def set_physics(
+        self,
+        slope: float | None = None,
+        friction: float | None = None,
+        com_offset: np.ndarray | None = None,
+    ) -> None:
+        """Pin physics values instead of randomizing them.
+
+        ``slope`` is the terrain incline in rad (rising along world +y), ``friction`` the
+        floor friction coefficient and ``com_offset`` the CoM shift in m (body frame:
+        x = axle, y = forward, z = up). Friction and CoM take effect immediately, the slope
+        at the next reset, which places the robot on it.
+        """
+        if slope is not None:
+            self.persistent["override_slope"] = jnp.float32(slope)
+        if friction is not None:
+            self.persistent["override_friction"] = jnp.float32(friction)
+            self._set_info(friction_scale=friction / self.env.nominal_ground_friction)
+            self.readings["friction_scale"] = friction / self.env.nominal_ground_friction
+        if com_offset is not None:
+            self.persistent["override_com"] = jnp.asarray(com_offset, dtype=jnp.float32)
+            self._set_info(com_offset=com_offset)
+            self.readings["com_offset"] = np.asarray(com_offset)
+
+    @property
+    def physics(self) -> dict:
+        """Current slope (rad), floor friction coefficient and CoM offset (m)."""
+        return {
+            "slope": float(self.readings["slope"]),
+            "friction": float(self.readings["friction_scale"]) * self.env.nominal_ground_friction,
+            "com_offset": np.array(self.readings["com_offset"]),
+        }
+
+    @property
+    def observation(self) -> np.ndarray:
+        return self.readings["observation"]
+
+    def step(self, action: np.ndarray) -> dict:
+        self.state, readings = self._drive(
+            self.state, jnp.asarray(self.command), jnp.asarray(action, dtype=jnp.float32)
+        )
+        self.readings = jax.device_get(readings)
+        return self.readings
+
+    def sync(self) -> None:
+        """Copy the latest state into the MjData shown in the window."""
+        for name in ("qpos", "qvel", "mocap_quat", "xfrc_applied"):
+            getattr(self.data, name)[:] = self.readings[name]
+        mujoco.mj_forward(self.env.mj_model, self.data)
+
+    def heading_degrees(self) -> float:
+        forward = self.readings["forward"]
+        return float(np.degrees(np.arctan2(forward[1], forward[0])))
+
+
+class KeyboardTeleop:
+    def __init__(self, sim: TeleopSim, max_linear: float, max_angular: float):
+        self.sim = sim
+        self.env = sim.env
         self.max_linear = max_linear
         self.max_angular = max_angular
         self.speed_fraction = 1.0
@@ -84,8 +221,9 @@ class KeyboardTeleop:
         self.editing: int | None = None  # key of the physics value being typed in
         self.edit_text = ""
         self.message = ""
-        env.render()  # creates the window
-        self.viewer = env.mujoco_renderer.viewer
+        self.renderer = MujocoRenderer(sim.env.mj_model, sim.data, width=1280, height=720)
+        self.renderer.render("human")  # creates the window
+        self.viewer = self.renderer.viewer
         self._viewer_key_callback = self.viewer._key_callback
         glfw.set_key_callback(self.viewer.window, self._key_callback)
         glfw.set_char_callback(self.viewer.window, self._char_callback)
@@ -114,9 +252,9 @@ class KeyboardTeleop:
     def _physics_key(self, key: int) -> None:
         if self.editing is None:
             if key == glfw.KEY_N:
-                self.env.set_physics(
+                self.sim.set_physics(
                     slope=0.0,
-                    friction=self.env.nominal_friction,
+                    friction=self.env.nominal_ground_friction,
                     com_offset=np.zeros(3),
                 )
                 self.reset_requested = True
@@ -139,18 +277,18 @@ class KeyboardTeleop:
             self.message = f"'{self.edit_text}' is not a number"
             return
         if key == glfw.KEY_G:
-            self.env.set_physics(slope=value)
+            self.sim.set_physics(slope=value)
             self.reset_requested = True  # the robot is placed on the new slope
         elif key == glfw.KEY_F:
             if value <= 0:
                 self.message = "friction must be positive"
                 return
-            self.env.set_physics(friction=value)
+            self.sim.set_physics(friction=value)
         else:
-            com_offset = self.env.physics["com_offset"]
-            com_offset[field.com_axis] = value / 1000.0
-            self.env.set_physics(com_offset=com_offset)
-        self.message = f"{field.label} = {value:g} {field.unit}"
+            com_offset = self.sim.physics["com_offset"]
+            com_offset[(glfw.KEY_X, glfw.KEY_Y, glfw.KEY_Z).index(key)] = value / 1000.0
+            self.sim.set_physics(com_offset=com_offset)
+        self.message = f"{label} = {value:g} {unit}"
 
     def _char_callback(self, window, codepoint: int) -> None:
         # Characters, not key codes, so "+" and "-" work on any keyboard layout and keypad.
@@ -168,9 +306,9 @@ class KeyboardTeleop:
         view = CAMERA_VIEWS[self.camera_view]
         camera = self.viewer.cam
         camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-        camera.trackbodyid = self.env.base_body_id
-        camera.elevation = view.elevation
-        camera.distance = view.distance
+        camera.trackbodyid = self.env.mj_model.body("base_link").id
+        camera.elevation = elevation
+        camera.distance = distance
 
     def _pressed(self, key: int) -> bool:
         return glfw.get_key(self.viewer.window, key) == glfw.PRESS
@@ -191,15 +329,11 @@ class KeyboardTeleop:
         view = CAMERA_VIEWS[self.camera_view]
         if view.azimuth is not None:
             # Turn with the robot; the mouse can still zoom (scroll).
-            self.viewer.cam.azimuth = self.env.heading_degrees + view.azimuth
-            self.viewer.cam.elevation = view.elevation
+            self.viewer.cam.azimuth = self.sim.heading_degrees() + relative_azimuth
+            self.viewer.cam.elevation = elevation
         self.viewer.add_overlay(mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT, HELP, "")
-        self._draw_edit_prompt()
-        self._draw_physics()
-        self._draw_status(info, view.name)
-        self.env.render()
-
-    def _draw_edit_prompt(self) -> None:
+        physics = self.sim.physics
+        com_mm = physics["com_offset"] * 1000.0
         if self.editing is not None:
             field = PHYSICS_KEYS[self.editing]
             prompt = f"{field.label} [{field.unit}], {field.training_range}"
@@ -231,50 +365,55 @@ class KeyboardTeleop:
             f"{info['curriculum_stage']}\n"
             f"{view_name}",
         )
+        self.sim.sync()
+        self.renderer.render("human")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Drive a trained policy with the keyboard.")
-    parser.add_argument("--model", type=Path, default=DEFAULT_TRAINING_CONFIG.evaluation_model_path)
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help="Training run directory or policy.bin file (default: the newest run).",
+    )
     parser.add_argument(
         "--stage",
-        type=int,
-        default=2,
-        choices=range(1, 4),
-        help="2 = clean simulation, 3 = add noise, latency, slopes and random pushes.",
+        default="-1",
+        help="Curriculum stage to simulate, by name or index (default -1, the last: noise, "
+        'latency, slopes and pushes; "commands 0.5 m/s" for a clean simulation). Stages: '
+        + ", ".join(f'{i} "{s.name}"' for i, s in enumerate(CURRICULUM)),
     )
     parser.add_argument("--render-every", type=int, default=2, help="Render every N control steps.")
     args = parser.parse_args()
 
-    env = SelfBalancingRobotEnv(
-        render_mode="human",
-        curriculum_stage=args.stage,
-        max_episode_steps=np.iinfo(np.int64).max,
-    )
-    env.set_difficulty_level(env.max_level)  # full stage-3 slopes and pushes
-    model = load_model(args.model, device="cpu")
-    linear_limit, angular_limit = DEFAULT_CURRICULUM_CONFIG.command_limits
-    env.hold_command(0.0, 0.0)
-    observation, _ = env.reset()
-    teleop = KeyboardTeleop(env, linear_limit, angular_limit)
+    try:
+        env = SelfBalancingRobotEnv(
+            start_stage=args.stage, fixed_difficulty=True, max_episode_steps=2**31 - 1
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    actor = Actor.load(resolve_model(args.model))
+    linear_limit, angular_limit = FULL_COMMAND
+    sim = TeleopSim(env)
+    teleop = KeyboardTeleop(sim, linear_limit, angular_limit)
 
     step = 0
     while teleop.window_open:
         start = time.perf_counter()
-        env.hold_command(*teleop.command())
-        action, _ = model.predict(observation, deterministic=True)
-        observation, _, terminated, _, info = env.step(action)
-        if terminated or teleop.reset_requested:
-            if terminated:
-                print(f"Robot fell ({info['terminated_reason']}), resetting.")
+        sim.hold_command(*teleop.command())
+        info = sim.step(actor.predict(sim.observation))
+        if info["terminated"] or teleop.reset_requested:
+            if info["terminated"]:
+                print("Robot fell, resetting.")
             teleop.reset_requested = False
-            observation, _ = env.reset()
+            sim.reset()
         step += 1
         if step % args.render_every == 0:
             teleop.render(info)
         # Run in real time.
         time.sleep(max(env.dt - (time.perf_counter() - start), 0.0))
-    env.close()
+    teleop.renderer.close()
 
 
 if __name__ == "__main__":

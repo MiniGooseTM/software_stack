@@ -55,7 +55,7 @@ class AsymmetricMlpExtractor(nn.Module):
 
 
 class AsymmetricActorCriticPolicy(ActorCriticPolicy):
-    """Actor: Linear(11*H) -> 128 -> 64 -> 32 -> 2, critic: Linear(S) -> 128 -> 64 -> 1, ReLU only.
+    """Actor: Linear(11*H) -> 128 -> 64 -> 32 -> 2, critic: Linear(S) -> 128 -> 64 -> 32 -> 1, ReLU only.
 
     The action mean is a plain linear output (no tanh), clipped to [-1, 1] by the
     environment and by the ESP32 firmware.

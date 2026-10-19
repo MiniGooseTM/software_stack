@@ -1,6 +1,5 @@
 <mujoco model="MiniGoose">
     <compiler angle="radian" eulerseq="XYZ" inertiafromgeom="false" />
-    <option timestep="0.002" integrator="implicitfast" />
 
     <default>
         <default class="visual">
@@ -8,8 +7,10 @@
             <geom type="mesh" contype="0" conaffinity="0" group="2" density="0"/>
         </default>
         <default class="collision">
-            <!-- group 3 is hidden by default -->
-            <geom contype="1" conaffinity="1" group="3"/>
+            <!-- group 3 is hidden by default. contype 2 / conaffinity 1: robot parts collide with
+                 the ground (contype 1 / conaffinity 2 in env_v0.xml) but not with each other,
+                 which keeps MJX from checking wheel-wheel pairs. -->
+            <geom contype="2" conaffinity="1" group="3"/>
         </default>
         <geom contype="1" conaffinity="1" friction="0.8 0.005 0.0001"/>
     </default>

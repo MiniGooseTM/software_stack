@@ -3,29 +3,37 @@ from pathlib import Path
 
 import numpy as np
 
+from self_balancing_robot.actor import Actor, resolve_model
 from self_balancing_robot.config import DEFAULT_TRAINING_CONFIG
+from self_balancing_robot.curriculum import CURRICULUM
 from self_balancing_robot.envs.balance_env import SelfBalancingRobotEnv
-from self_balancing_robot.metrics import METRIC_KEYS, plot_episode, run_episode, summarize
-from self_balancing_robot.policy import load_model
+from self_balancing_robot.metrics import (
+    METRIC_KEYS,
+    plot_episode,
+    render_trace,
+    run_episodes,
+    summarize,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a trained balancing policy.")
     parser.add_argument(
-        "--model", type=Path, default=DEFAULT_TRAINING_CONFIG.evaluation_model_path
+        "--model",
+        type=Path,
+        default=None,
+        help="Training run directory or policy.bin file (default: the newest run).",
     )
     parser.add_argument(
         "--episodes", type=int, default=DEFAULT_TRAINING_CONFIG.evaluation_episodes
     )
     parser.add_argument(
         "--stage",
-        type=int,
-        default=1,
-        choices=range(1, 4),
-        help="Curriculum stage to run at its last level: 1 = balance, 2 = full commands, "
-        "3 = full commands with slopes, pushes, noise and latency.",
+        default="-1",
+        help="Curriculum stage to run, by name or index (default -1, the last). Stages: "
+        + ", ".join(f'{i} "{s.name}"' for i, s in enumerate(CURRICULUM)),
     )
-    parser.add_argument("--seed", type=int, default=None, help="Seed of the first episode.")
+    parser.add_argument("--seed", type=int, default=0, help="Seed of the first episode.")
     parser.add_argument(
         "--plot-dir",
         type=Path,
@@ -33,28 +41,35 @@ def main() -> None:
         help="Save a command-vs-response plot of every episode to this directory.",
     )
     parser.add_argument(
-        "--render",
-        action="store_true",
-        help="Show the MuJoCo viewer (requires a graphical display).",
+        "--video",
+        type=Path,
+        default=None,
+        help="Save the first episode as an MP4 here (headless: MUJOCO_GL=egl).",
     )
     args = parser.parse_args()
 
-    env = SelfBalancingRobotEnv(
-        render_mode="human" if args.render else None, curriculum_stage=args.stage
+    model = resolve_model(args.model)
+    actor = Actor.load(model)
+    env = SelfBalancingRobotEnv()
+    try:
+        stage = env.stage_index(args.stage)
+    except ValueError as error:
+        parser.error(str(error))
+    # All episodes run in parallel.
+    traces = run_episodes(
+        env,
+        actor,
+        [args.seed + episode for episode in range(args.episodes)],
+        stage=stage,
+        record_states=args.video is not None,
     )
-    model = load_model(args.model, env=env, device="cpu")
-    env.set_difficulty_level(env.max_level)  # full commands (and slopes and pushes in stage 3)
+    print(f'Evaluating {model} at stage {stage} "{traces[0]["stage_name"]}"')
     summaries = []
-    for episode in range(args.episodes):
-        seed = None if args.seed is None else args.seed + episode
-        trace = run_episode(env, model, seed=seed)
-        # Keep the requested stage even if the env's own curriculum would advance.
-        env.set_curriculum_stage(args.stage)
-        env.set_difficulty_level(env.max_level)
+    for episode, trace in enumerate(traces):
         summary = summarize(trace)
         summaries.append(summary)
         print(
-            f"episode={episode + 1} stage={trace['stage']} end={trace['end']} "
+            f"episode={episode + 1} end={trace['end']} "
             f"duration={trace['time'][-1]:.1f}s reward={summary['reward']:.1f} "
             f"mean|v_err|={summary['linear_error']:.3f}m/s "
             f"mean|yaw_err|={summary['angular_error']:.3f}rad/s "
@@ -63,7 +78,7 @@ def main() -> None:
         if args.plot_dir is not None:
             plot_episode(
                 trace,
-                args.plot_dir / f"episode_{episode + 1:02d}_stage{args.stage}.png",
+                args.plot_dir / f"episode_{episode + 1:02d}_stage{stage}.png",
                 f"Episode {episode + 1},",
             )
     print(
@@ -73,7 +88,12 @@ def main() -> None:
             for key in METRIC_KEYS
         )
     )
-    env.close()
+    if args.video is not None:
+        import imageio
+
+        args.video.parent.mkdir(parents=True, exist_ok=True)
+        imageio.mimsave(args.video, render_trace(env, traces[0]), fps=round(1 / env.dt))
+        print(f"Saved {args.video}")
 
 
 if __name__ == "__main__":

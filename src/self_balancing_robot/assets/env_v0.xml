@@ -28,11 +28,16 @@
     </asset>
 
     <worldbody>
-        <geom name="ground"
-          type="plane"
-          size="5 5 0.1"
-          material="floor"/>
-
+        <!-- Mocap body so the training code can tilt the terrain per episode (mocap_quat):
+             MuJoCo never updates the pose of geoms attached directly to the world body. -->
+        <body name="terrain" mocap="true">
+            <geom name="ground"
+              type="plane"
+              size="5 5 0.1"
+              contype="1"
+              conaffinity="2"
+              material="floor"/>
+        </body>
     </worldbody>
 
    
