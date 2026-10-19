@@ -1,16 +1,6 @@
-"""The ESP32 policy: network definition for training and a plain MLP for inference.
-
-Training (Brax PPO) uses an asymmetric actor-critic (ARCHITECTURE.md, Option B):
-- actor: ``state`` (88 values) -> 128 -> 64 -> 32 -> 2, ReLU, linear output (the action
-  mean; Brax adds a learned state-independent std for exploration);
-- critic: ``privileged_state`` (25 values) -> 128 -> 64 -> 1, discarded after training.
-
-Everything after training (evaluation, teleop, export) runs the actor as `Actor`: a list of
-``(W, b)`` layers, y = W x + b with ReLU on all layers but the last, output clipped to
-[-1, 1] — exactly the forward pass of the ESP32 firmware. An `Actor` loads from a training
-run (Brax parameters) or from a policy file (`policy.bin`).
 """
-
+The ESP32 policy: network definition for training and a plain MLP for inference.
+"""
 from __future__ import annotations
 
 import functools
@@ -42,15 +32,9 @@ def network_factory(config: PolicyConfig = DEFAULT_POLICY_CONFIG):
         activation=linen.relu,
         policy_obs_key=ACTOR_KEY,
         value_obs_key=CRITIC_KEY,
-        # Plain Gaussian (no tanh): the deterministic action is the linear mean, which the
-        # firmware clips to [-1, 1] like the environment does.
         distribution_type="normal",
         noise_std_type="log",
         init_noise_std=config.init_noise_std,
-        # SB3's initialization (as in the earlier runs): orthogonal, gain sqrt(2) in hidden
-        # layers and 0.01 for the action mean, so training starts near zero action. With
-        # Brax's default (lecun_uniform) the first actions were large and random, and runs
-        # learned to balance while spinning in place (see `yaw_rate_limit_rad_s`).
         policy_network_kernel_init_fn=jax.nn.initializers.orthogonal,
         policy_network_kernel_init_kwargs={"scale": float(np.sqrt(2))},
         value_network_kernel_init_fn=jax.nn.initializers.orthogonal,

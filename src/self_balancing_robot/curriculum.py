@@ -1,21 +1,5 @@
-"""The training curriculum: an ordered list of stages, each with everything that defines it.
-
-A `Stage` says what the environment samples (command range, slopes, pushes, randomized
-physics, sensor latency and noise), the reward weights (`RewardConfig`, from `config.py`
-unless the stage changes them) and the test to leave it. Training starts at the first
-stage of `CURRICULUM` and moves to the next one once a window of `EVALUATION_WINDOW`
-episodes, pooled over all parallel environments, passes the stage's test (see
-`envs/wrappers.py`). The last stage is never left.
-
-To add or change a stage, edit `CURRICULUM` below; nothing else needs to change. Each stage is
-written as the previous one plus what changes (`replace(previous, ...)`).
-
-Magnitudes (command speed and yaw rate, slope, push, CoM shift and wheel torque kicks) are
-drawn per stage as: 0 with `zero_probability` (stand still, flat ground, no push), in the
-band the stage added (from the previous stage's maximum up to this stage's) with
-`frontier_probability`, otherwise uniform below that band, so easier values keep being
-practised. If a stage does not raise a quantity, it is drawn as 0 or uniform up to its
-maximum. Signs and directions are random.
+"""
+The training curriculum: an ordered list of stages, each with everything that defines it.
 """
 
 from __future__ import annotations
@@ -26,33 +10,20 @@ import numpy as np
 
 from self_balancing_robot.config import DEFAULT_REWARD_CONFIG, RewardConfig
 
-# Full command range (v m/s, omega rad/s): observations are scaled by it, and every command
-# is scaled down so the outer wheel never needs more than the full speed (see
-# `SelfBalancingRobotEnv.wheel_feasible_command`). Up to v8 it was 0.4 m/s (~30% motor torque
-# left for balancing; 0.5 m/s left ~14% and v4 fell more). 0.3 m/s leaves headroom for the
-# speed bias a CoM shift causes: v8 with +1 cm drove ~0.15 m/s too fast, saturated the
-# motors at 0.4 m/s and fell. 0.5 m/s and 3.0 rad/s (94% of the goose robot's 0.53 m/s
-# no-load wheel speed) stalled at randomization 3/6 (run 20261011-162254, 59% survival at the
-# last stage); 0.4 m/s and 2.5 rad/s finished the curriculum (run 20261011-232238).
+# (max linear velocity, max angular velocity)
 FULL_COMMAND = (0.4, 2.5)
-# Commands are redrawn every 3 to 5 s. A reversal (see `Stage.reversal_probability`) goes to
-# the opposite direction at this fraction to 100% of the stage's speed limit, no turning.
+# Commands are redrawn every 3 to 5 s
 COMMAND_RESAMPLE_S = (3.0, 5.0)
+# probability of a command change being a full reversal
 REVERSAL_MIN_FRACTION = 0.75
 
-# The curriculum is global: every environment trains at the same stage (with thousands of GPU
-# environments each one only finishes a few dozen episodes per run, too few for a
-# per-environment window). Episodes that finish at the current stage are pooled in windows of
-# this many episodes, and each full window is checked against the stage's test.
+# number of finished episodes to check the success rate, speed ratio and still-speed limit
 EVALUATION_WINDOW = 1_000
-# Speed ratio = speed along the command / commanded speed, counting commands of at least
-# this fraction of the stage's speed limit (and at least SPEED_RATIO_MIN_COMMAND m/s) held
-# at least SPEED_RATIO_SETTLE_S (the acceleration after each new command is ignored).
+
 SPEED_RATIO_MIN_FRACTION = 1.0 / 3.0
 SPEED_RATIO_MIN_COMMAND = 0.05
 SPEED_RATIO_SETTLE_S = 1.0
-# Battery voltage (V) the motor model in `assets/goose.xml` is written for (3S LiPo nominal):
-# its no-load speed (ctrlrange) and stall torque (forcerange) scale with the voltage.
+# nominal battery voltage (V) for the ESP32 and the motors, used to scale the motor torque and speed
 NOMINAL_VOLTAGE = 11.1
 
 
@@ -62,7 +33,6 @@ class Stage:
 
     name: str
 
-    # --- What the environment samples (maxima; 0 = off) ---
     # Largest |v| (m/s) and |omega| (rad/s) commanded.
     command_max: tuple[float, float] = (0.0, 0.0)
     # Chance that a command change mid-episode is a full reversal instead of a random command.
@@ -77,7 +47,7 @@ class Stage:
     push_interval_s: tuple[float, float] = (2.0, 4.0)
     push_duration_s: float = 0.1
     # Torque kicks on each wheel (N m), lasting `wheel_kick_duration_s`, one every
-    # `wheel_kick_interval_s`: bumps and stiction.
+    # `wheel_kick_interval_s`: simulates bumps.
     wheel_kick_max: float = 0.0
     wheel_kick_interval_s: tuple[float, float] = (1.0, 3.0)
     wheel_kick_duration_s: float = 0.05
@@ -86,8 +56,7 @@ class Stage:
     # Base mass and floor friction: uniform within +- this fraction of nominal.
     mass_fraction: float = 0.0
     friction_fraction: float = 0.0
-    # Battery voltage (V), uniform in (min, max): the motors' no-load speed and stall torque
-    # for a given PWM duty scale with it.
+    # Battery voltage (V), uniform in (min, max)
     battery_voltage: tuple[float, float] = (NOMINAL_VOLTAGE, NOMINAL_VOLTAGE)
     # Motor, IMU and encoder delays: each 0 to this many control steps (10 ms).
     max_latency_steps: int = 0
@@ -103,11 +72,9 @@ class Stage:
     rewards: RewardConfig = DEFAULT_REWARD_CONFIG
 
     # --- The test to leave the stage, on a window of finished episodes (None = not checked) ---
-    # Episodes played at the stage before any window can pass.
     min_episodes: int = 0
-    # Fraction of episodes reaching the timeout without falling.
     success_rate: float = 0.95
-    # Speed along the command / commanded speed (see SPEED_RATIO_*).
+    # Speed along the command / commanded speed.
     speed_ratio: float | None = None
     # Mean |v| (m/s) on zero speed commands held at least SPEED_RATIO_SETTLE_S.
     still_speed_limit: float | None = None
@@ -117,23 +84,10 @@ class Stage:
 
 # --- The default curriculum ---
 
-# Learn to balance: zero command, flat ground, nominal physics, perfect sensors.
+# Learn to balance
 BALANCE = Stage(name="balance", success_rate=0.95)
 
-# Learn to follow commands, the range growing in quarters of FULL_COMMAND: steps of 0.1 m/s
-# (and 0.625 rad/s). Two fixed
-# ranges (0.05, then 0.4 m/s) let v5/v6 pass the first barely moving (~20% of the command)
-# and the second had to unlearn it. The first step stays at 0.1 m/s: starting from 0.05 m/s,
-# v7 never passed it, as at 0.05 m/s the speed signal is lost in balancing wobble and gearbox
-# friction (36% -> 4% of the command from 3M to 5M steps). Reversals: with random commands
-# only 0.3-0.6% of changes were full reversals, and v9 fell on most joystick flips
-# (+0.3 -> -0.3 m/s), braking so hard it pitched to ~30 deg. The speed ratio replaced an
-# absolute error threshold that let v5 advance driving at ~60% of the command. Stops: with
-# speed and yaw rate each 0 at `zero_probability`, only ~1% of commands were (0, 0), the
-# most common command on the robot; v4 and v6 drifted standing still.
-# Sensor noise grows alongside in quarters and latency by one step at 0.2 and 0.4 m/s: switched
-# on together with everything else at the first randomization stage (run 20261010-165211),
-# survival there fell from ~100% to 35% and the mean |pitch| rose from ~1 to 6.5 deg.
+# Introduce commands and sensor noise gradually.
 IMU_ANGLE_NOISE = 0.01
 IMU_RATE_NOISE = 0.05
 ENCODER_NOISE = 0.3
@@ -178,26 +132,12 @@ COMMANDS_4 = replace(
     imu_rate_noise=IMU_RATE_NOISE,
     encoder_noise=ENCODER_NOISE,
 )
-
-# Full commands on an imperfect world. Mass, friction and battery voltage are on from the
-# first step (noise and latency already are); slope, pushes, the CoM shift and the wheel
-# torque kicks grow in six equal steps up to 0.3 rad, 0.5 N, 8 mm and 0.02 N m.
-# - Pushes: the robot weighs 0.27 kg, so a 0.1 s push of 1 N (the maximum up to v9) gave it
-#   ~0.37 m/s, more than the full command and ~70% of the wheel no-load speed (~0.53 m/s);
-#   0.5 N gives ~0.19 m/s.
-# - Wheel torque kicks: ~18% of the 0.109 N m stall torque per motor. There is no constant
-#   torque offset per wheel: the randomized battery voltage already scales the motor torque.
-# - Battery: a 3S LiPo goes from ~12.5 V charged down to ~10.5 V before cutoff, so the same
-#   PWM duty gives -5% to +13% of the nominal (11.1 V) motor speed and torque.
-# - Slopes: the base hits the ground at 0.5 rad of tilt relative to the surface, so above
-#   ~0.3 rad slopes cannot be driven straight up or down (v2: 0% survival above 0.3 rad).
-# - CoM: the nominal CoM is 4.9 cm above the axle. Up to v7 the shift was 4.9 mm from the
-#   start, and v7 still drifted at 0.1 m/s standing still with 5 mm forward and fell with
-#   1 cm; v8 (1 cm) stalled with 5-7 mm. 8 mm needs ~9 deg of lean to balance.
-# - Test: the speed ratio stays at 0.90 as in the command stages, although slopes cost speed
-#   uphill (at 0.3 rad, 0.4 m/s took almost full duty); v6 (85% survival, no speed check)
-#   drifted back to ~70% of the command. Standing still on slopes: v4 and v6 drifted at
-#   0.07-0.10 m/s.
+# start with domain randomization
+# --> pushes
+# --> slopes
+# --> wheel kicks
+# --> COM offsets
+# --> mass and friction randomization
 PUSH_MAX = 0.5
 COM_OFFSET_MAX = 0.008
 WHEEL_KICK_MAX = 0.02
@@ -240,11 +180,7 @@ RANDOMIZATION_4 = replace(
     com_offset_max=COM_OFFSET_MAX * 4 / 6,
     wheel_kick_max=WHEEL_KICK_MAX * 4 / 6,
 )
-# The last two stages ask for smoother actions. Up to here the smoothness term cost < 1% of
-# the reward (run 20261011-120218: (a_t - a_t-1)^2 ~0.008 per step against ~5 from staying up
-# and tracking), so it hardly shaped the policy. It is not raised from the start: it also
-# charges the exploration noise, ~1.4 per step at the initial std of 0.6 (14 at a weight of
-# 10, far above the alive reward), while by these stages the std is ~0.06.
+# increase the smoothness weight to get smoother policy without jittering
 RANDOMIZATION_5 = replace(
     RANDOMIZATION_4,
     name="randomization 5/6",

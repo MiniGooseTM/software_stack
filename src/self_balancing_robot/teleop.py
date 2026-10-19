@@ -1,9 +1,4 @@
 """Drive a trained policy with the keyboard in a live MuJoCo window.
-
-Hold the arrow keys to command the robot: up/down for forward/backward speed and
-left/right for turning. The policy only receives the (v_cmd, omega_cmd) command,
-exactly like on the real robot. The simulation is the JAX training environment, stepped
-one control period at a time (GPU or CPU) and mirrored into a MuJoCo window.
 """
 
 import argparse

@@ -1,12 +1,8 @@
 """Train the balancing policy with Brax PPO on the GPU (thousands of MJX environments).
 
-Everything a run produces goes into its run directory (default ``models/runs/<time>``):
-``params.pkl`` (latest checkpoint), ``curriculum.json`` (stage index and name, steps; read by
-``--resume``), ``config.json``, ``plots/`` and ``videos/``. TensorBoard logs go to
-``logs/<run name>``.
+Everything a run produces goes into its run directory.
 
-When a curriculum stage is passed, and when training ends, one deterministic episode at that
-stage is saved as a plot (``plots/stages/``) and a video (``videos/``).
+When a curriculum stage is passed, a plot and a video of one deterministic episode at that stage is saved.
 """
 
 from __future__ import annotations
