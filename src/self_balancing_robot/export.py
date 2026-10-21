@@ -1,25 +1,8 @@
-"""Export the trained actor's weights for the ESP32 (ARCHITECTURE.md, section 4).
+"""Export the trained actor's weights for the ESP32.
 
 Two files with the same content:
-- a C header with every actor layer as ``W[out][in]`` / ``b[out]`` (y = W x + b, ReLU on all
-  layers but the last) and the constants needed to build the observation exactly as in
-  training (scaling, history length, control period, limits);
-- a binary policy file, which the robot firmware embeds as its built-in policy (and which can
-  be uploaded through its web page). It also holds test vectors, the trained policy's own
-  actions (Brax, in JAX) for a few simulated observations, that the firmware checks its
-  forward pass against at boot.
-
-Policy file, version 1, little-endian (read by ESP32_software/robot/main/policy_net.c):
-    header (`_HEADER`, 96 bytes):
-        magic b"GPOL", version, header size, total size (CRC included),
-        layers, input size, output size, frame size, history length, test vectors,
-        CRC-32 of the frame field names joined by ",",
-        control period (s), max linear / angular command, half track (m),
-        wheel no-load speed (rad/s), tilt limit (rad), model name (44 bytes, NUL-terminated)
-    per layer: in, out, activation (0 none, 2 relu), reserved      4 x uint16
-    per layer: W[out][in] row-major, then b[out]                     float32
-    test inputs [tests][input size], test outputs [tests][output size]  float32
-    CRC-32 (zlib) of everything before it                             uint32
+- a C header with the weights as static arrays
+- a binary policy file for the firmware to load at boot
 """
 
 import argparse

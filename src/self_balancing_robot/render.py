@@ -1,13 +1,4 @@
 """Render recorded episodes to MP4 videos, in a separate process during training.
-
-Training saves the states of each recorded episode (``videos/<name>.npz``) and renders them in
-a child process: a missing or broken OpenGL setup can abort the whole process (a headless
-server without a display, or a MIG GPU slice, which has no graphics support), and that must
-never stop training. The child tries the OpenGL backends one after the other; for OSMesa it
-also uses the libraries ``scripts/setup_osmesa.sh`` extracts (no sudo needed). If none works,
-the states files stay; render them on another machine with::
-
-    python -m self_balancing_robot.render models/runs/<run>/videos/*.npz
 """
 
 from __future__ import annotations

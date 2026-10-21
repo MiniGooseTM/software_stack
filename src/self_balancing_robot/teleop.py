@@ -1,9 +1,4 @@
 """Drive a trained policy with the keyboard in a live MuJoCo window.
-
-Hold the arrow keys to command the robot: up/down for forward/backward speed and
-left/right for turning. The policy only receives the (v_cmd, omega_cmd) command,
-exactly like on the real robot. The simulation is the JAX training environment, stepped
-one control period at a time (GPU or CPU) and mirrored into a MuJoCo window.
 """
 
 import argparse
@@ -366,7 +361,7 @@ def main() -> None:
         "--stage",
         default="-1",
         help="Curriculum stage to simulate, by name or index (default -1, the last: noise, "
-        'latency, slopes and pushes; "commands 0.3 m/s" for a clean simulation). Stages: '
+        'latency, slopes and pushes; "commands 0.5 m/s" for a clean simulation). Stages: '
         + ", ".join(f'{i} "{s.name}"' for i, s in enumerate(CURRICULUM)),
     )
     parser.add_argument("--render-every", type=int, default=2, help="Render every N control steps.")
